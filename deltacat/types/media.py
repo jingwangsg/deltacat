@@ -25,6 +25,7 @@ class ContentType(str, Enum):
 
     # unregistered types
     FEATHER = "application/feather"
+    LANCE = "application/vnd.lance"
     ORC = "application/orc"
     PARQUET = "application/parquet"
     PSV = "text/psv"
@@ -62,6 +63,7 @@ EXT_TO_CONTENT_TYPE: Dict[str, ContentType] = {
     ".psv": ContentType.PSV,
     ".json": ContentType.JSON,
     ".feather": ContentType.FEATHER,
+    ".lance": ContentType.LANCE,
     ".avro": ContentType.AVRO,
     ".orc": ContentType.ORC,
 }
@@ -91,6 +93,7 @@ SCHEMA_CONTENT_TYPES: Set[str] = {
     ContentType.ORC.value,
     ContentType.FEATHER.value,
     ContentType.AVRO.value,
+    ContentType.LANCE.value,
 }
 
 DELIMITED_TEXT_CONTENT_TYPES: Set[str] = {
@@ -109,6 +112,7 @@ TABULAR_CONTENT_TYPES: Set[str] = {
     ContentType.ORC.value,
     ContentType.FEATHER.value,
     ContentType.AVRO.value,
+    ContentType.LANCE.value,
 }
 
 EXPLICIT_COMPRESSION_CONTENT_TYPES: Set[str] = {
@@ -130,6 +134,7 @@ class DatasetType(str, Enum):
     """
 
     # local
+    LANCE = "lance"  # lance.LanceDataset (lazy; O(1) random access via take())
     NUMPY = "numpy"  # numpy.ndarray
     PANDAS = "pandas"  # pandas.DataFrame
     POLARS = "polars"  # polars.DataFrame

@@ -205,7 +205,12 @@ def _create_table_for_write(
 ) -> TableDefinition:
     """Creates a new table, table version, and/or stream in preparation for a write operation."""
     if "schema" not in kwargs:
-        kwargs["schema"] = infer_table_schema(data)
+        if data is not None:
+            kwargs["schema"] = infer_table_schema(data)
+        elif kwargs.get("manifest") is not None:
+            pass  # manifest-only write — schema will be inferred from manifest
+        else:
+            kwargs["schema"] = infer_table_schema(data)
 
     _validate_content_type_against_supported_content_types(
         namespace,
@@ -224,13 +229,14 @@ def _create_table_for_write(
 
 
 def write_to_table(
-    data: Dataset,
-    table: str,
+    data: Dataset = None,
+    table: str = "",
     *args,
     namespace: Optional[str] = None,
     table_version: Optional[str] = None,
     mode: TableWriteMode = TableWriteMode.AUTO,
     content_type: ContentType = ContentType.PARQUET,
+    manifest: Optional[Any] = None,
     transaction: Optional[Transaction] = None,
     **kwargs,
 ) -> List[Delta]:
@@ -277,6 +283,8 @@ def write_to_table(
 
         # Get or create table, table version, and/or stream
         if not table_exists_flag:
+            if manifest is not None:
+                kwargs["manifest"] = manifest
             table_definition = _create_table_for_write(
                 data,
                 table,
@@ -367,6 +375,29 @@ def write_to_table(
             stream,
             **kwargs,
         )
+
+        # --- Manifest-only (thin-client) write path ---
+        # When a pre-built manifest is provided, the client has already
+        # written data files. Skip data processing and go to commit.
+        if manifest is not None:
+            from deltacat.storage.main.impl import (
+                stage_delta_from_manifest,
+                commit_delta as storage_commit_delta,
+                commit_partition as storage_commit_partition,
+            )
+
+            delta = stage_delta_from_manifest(
+                manifest=manifest,
+                partition=partition,
+                delta_type=delta_type,
+                content_type=content_type,
+            )
+            delta = storage_commit_delta(delta=delta, **kwargs)
+
+            if commit_staged_partition:
+                storage_commit_partition(partition=partition, **kwargs)
+
+            return [delta]
 
         # Get table properties for schema evolution
         schema_evolution_mode = table_version_obj.read_table_property(

@@ -17,10 +17,18 @@ from ray.data import (
     ReadTask,
 )
 from ray.data.block import BlockMetadata, Block, BlockAccessor
-from ray.data.datasource import (
-    FastFileMetadataProvider,
-    ParquetMetadataProvider,
-)
+try:
+    from ray.data.datasource import (
+        FastFileMetadataProvider,
+        ParquetMetadataProvider,
+    )
+except ImportError:
+    from ray.data.datasource import (
+        BaseFileMetadataProvider as FastFileMetadataProvider,
+    )
+
+    class ParquetMetadataProvider(FastFileMetadataProvider):  # type: ignore[no-redef]
+        pass
 
 from deltacat.constants import METAFILE_FORMAT_MSGPACK
 from deltacat.aws.s3u import (
@@ -57,7 +65,6 @@ class DeltacatReadType(str, Enum):
 
 class CachedFileMetadataProvider(
     FastFileMetadataProvider,
-    ParquetMetadataProvider,
 ):
     def __init__(self, meta_cache: Dict[str, BlockMetadata]):
         self._meta_cache = meta_cache

@@ -2737,6 +2737,40 @@ def stage_delta(
     return staged_delta
 
 
+def stage_delta_from_manifest(
+    manifest: Manifest,
+    partition: Partition,
+    delta_type: DeltaType = DeltaType.UPSERT,
+    properties: Optional[DeltaProperties] = None,
+    content_type: ContentType = ContentType.PARQUET,
+    schema: Optional[Schema] = None,
+    *args,
+    **kwargs,
+) -> Delta:
+    """Create an unregistered delta from a pre-built manifest (thin-client path)."""
+    if not partition.is_supported_content_type(content_type):
+        raise TableValidationError(
+            f"Content type {content_type} is not supported by "
+            f"partition: {partition}"
+        )
+    if partition.state == CommitState.DEPRECATED:
+        raise TableValidationError(
+            f"Cannot stage delta to {partition.state} partition: {partition}",
+        )
+    previous_stream_position: Optional[int] = (
+        partition.stream_position if delta_type != DeltaType.ADD else None
+    )
+    staged_delta: Delta = Delta.of(
+        locator=DeltaLocator.of(partition.locator, None),
+        delta_type=delta_type,
+        meta=manifest.meta,
+        properties=properties,
+        manifest=manifest,
+        previous_stream_position=previous_stream_position,
+    )
+    return staged_delta
+
+
 def commit_delta(
     delta: Delta,
     *args,
