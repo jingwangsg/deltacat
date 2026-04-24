@@ -1,0 +1,212 @@
+{
+  "$schema": "https://aka.ms/codetour-schema",
+  "title": "4 - DeltaCat 标准读取路径 (Parquet → PyArrow)",
+  "description": "dc.read_table(\"users\", namespace=\"demo\", read_as=DatasetType.PYARROW, columns=[\"id\", \"name\"])",
+  "overview": "# Tour · DeltaCat 标准读取路径\n\n负责**逻辑讲解** — 读的链条为什么这样组织、每一跳解决什么问题。\n配套 tour steps 负责**具体细节**:函数签名、分派表的 key、本次取值。每个 `[#N]` 超链接点一下,CodeTour 会跳到对应代码行。\n\n---\n\n## 这个脚本在解决什么问题\n\nChapter 2 讲了「写」:数据字节落到 `.parquet` 文件,再记一份 Manifest(文件清单)到 catalog。**读就是反过来**:从 catalog 找到 Manifest → 拿到一串文件路径 → 用对应格式的 reader 把字节反序列化回内存数据结构。\n\n本 tour 跟踪最常见的「标准 fat-client 读」——DeltaCat 自己负责把字节读进内存,返回一份 `pyarrow.Table` / `pandas.DataFrame` / Daft / Ray Dataset,**全流程代码都在 DeltaCat 里**。(Chapter 5 讲的 Lance thin-client 读,是另一条:DeltaCat 只给路径,读字节那步用户用 `lance` 直接做。)\n\n## 本次 tour 的「具体请求」\n\n```python\nimport deltacat as dc\nfrom deltacat.types.media import DatasetType\n\ndf = dc.read_table(\n    table=「users」,\n    namespace=「demo」,\n    read_as=DatasetType.PYARROW,    # 本次取值 — 本地 fat-client\n    columns=[「id」, 「name」],\n)\n```\n\n- `read_as=PYARROW` → 在 `DatasetType.local()` 集合里 → 走 `StorageType.LOCAL` → `_download_delta_local`。\n- 对照分支 `read_as=DAFT` / `RAY_DATASET` → 在 `DatasetType.distributed()` 集合里 → 走 `StorageType.DISTRIBUTED` → `_download_delta_distributed`(Ray 集群并行读)。\n\n## 大局观\n\n```\n  user                            Catalog 层                          Storage 层                 Types 层 (读 bytes)\n──────────── ┬─────────────────────────────────────────┬───────────────────────────┬──────────────────────────────\ndc.read_table     read_table                                                                                       \n              ├─▶ 1. setup_transaction     [#5]                                                                     \n              ├─▶ 2. _get_latest_active_.. [#6]  ── 拿 table_version_obj                                            \n              ├─▶ 3. _get_qualified_deltas [#7]  ── 找出要读的 delta 列表                                            \n              └─▶ 4. _download_and_process [#10]                                                                    \n                      ├─▶ Delta.merge_deltas [#12] ── N deltas → 1 merged_delta (合并 manifest)                     \n                      ├─▶ 决定 LOCAL / DISTRIBUTED [#13]                                                            \n                      └─▶ _get_storage().download_delta(merged_delta, ...)  [#14]                                   \n                                                           │                                                        \n                                                           ├─▶ download_delta (storage 层)          [#15]           \n                                                           │      dispatch LOCAL → _download_delta_local [#16] [#17]  \n                                                           │                                                        \n                                                           └───────▶ download_manifest_entries (types 层) [#18]     \n                                                                          │                                        \n                                                                          └─▶ 对每个 ManifestEntry:                \n                                                                                read_file ──▶ TABLE_TYPE_TO_READER_FUNC[PYARROW] \n                                                                                           = pa_utils.file_to_table  [#19] [#21]\n                                                                                                                    \n                                    ◀─ list[pa.Table] (每个 entry 一张) ◀───────────────────────────────────────    \n                      ┌─▶ _handle_local_table_concatenation [#22] [#23] ── coerce schema + concat                   \n                                                                                                                    \n              ◀─ 一整张 pa.Table 返回用户                                                                            \n```\n\n从 [#1] 开始跟踪 →\n\n---\n\n## 阶段 1 · Catalog 层:翻译用户意图\n\n### 为什么要分「qualify deltas」和「download data」两步\n\n[#7] · [#10]\n\nDeltaCat 的读分两半:**先读元数据,再读字节**。元数据回答「哪些文件是我要的」,字节回答「这些文件里装的是什么」。两步切开是因为:\n\n1. 元数据通常很小(几个 KB 的 JSON),字节可能很大(几十 GB),两者的并发策略完全不同。\n2. 元数据里包含 partition filter / 版本信息,先解析才能决定后面怎么并行。\n3. 先拿到 Manifest 之后,后面的代码就不需要关心「table/partition/delta」这些 catalog 概念了,只面对「一堆文件路径」。这让 Storage 层、Types 层不用再感知 catalog 结构。\n\n### 为什么要 merge_deltas\n\n[#12]\n\n一次读可能涉及多个 delta(每次写都是一个 delta)。每个 delta 自带一份 manifest,里面是一串文件路径。**直接拼接成一个大 manifest 比循环处理 N 个 delta 简洁得多**——下游 Storage / Types 代码只看到一个扁平的 `manifest.entries` 列表。\n\n## 阶段 2 · Storage 层:LOCAL vs DISTRIBUTED 的岔路\n\n[#13] · [#15] · [#16]\n\n这是整条读路径最关键的 fork。`read_as` 的值决定了这里分派到哪一支:\n\n| `read_as` | `DatasetType.local/distributed` | `storage_type` | dispatch 到 |\n|---|---|---|---|\n| `PYARROW` ✅ 本次 | local | `LOCAL` | `_download_delta_local` [#17] |\n| `PANDAS` / `POLARS` / `NUMPY` | local | `LOCAL` | `_download_delta_local` [#17] |\n| `PYARROW_PARQUET` | local | `LOCAL` | `_download_delta_local`(特殊:lazy,不 concat) |\n| `DAFT` | distributed | `DISTRIBUTED` | `_download_delta_distributed`(Ray 并行) |\n| `RAY_DATASET` | distributed | `DISTRIBUTED` | `_download_delta_distributed`(Ray 并行) |\n\n**设计洞察:**「本地多进程 vs Ray 分布式」是两套完全不同的并发策略,因此从 storage 层就分叉,而不是混在一起硬塞。\n\n## 阶段 3 · Types 层:按 content_type 选 reader\n\n[#18] · [#19] · [#21]\n\nStorage 层只知道「我要一堆本地 PyArrow Table」,但不知道文件是 Parquet 还是 CSV 还是 JSON。Types 层用 **`TABLE_TYPE_TO_READER_FUNC`** 这张静态 dispatch 表把「想要什么内存类型」映射到「哪个 reader 函数」;再在 reader 内部按 `content_type`(记录在 ManifestEntry 的 meta 里)选具体格式 handler。\n\n**本次取值链**:`DatasetType.PYARROW` → `TABLE_TYPE_TO_READER_FUNC[「pyarrow」]` = `pa_utils.file_to_table` → 看到 `content_type=「parquet」` → 调 `papq.read_table(...)`。\n\n## 阶段 4 · 收束:List[Table] → 一张大 Table\n\n[#22] · [#23]\n\n一个 ManifestEntry 一张 `pa.Table`,N 个 entry 就是 `List[pa.Table]`。最后一步 `_handle_local_table_concatenation` 做两件事:\n\n1. **schema coercion**:不同 delta 可能经历过 schema evolution,把每张表都往目标 schema 上靠。\n2. **concat**:`pa.concat_tables(...)` 把它们接成一张大表返回。\n\n---\n\n## 调参速查表\n\n| 想改什么 | 怎么改 | 回到 tour |\n|---|---|---|\n| 返回 Pandas 而不是 PyArrow | `read_as=DatasetType.PANDAS` | [#13] |\n| 分布式读(Ray 集群) | `read_as=DatasetType.DAFT` 或 `RAY_DATASET` | [#13] |\n| 只读部分列 | `columns=[「id」, 「name」]` | [#15] |\n| 多进程并行(本地) | `max_parallelism=8` | [#18] |\n| 只读某个 partition | `partition_filter=[...]` | [#7] |\n| 给每行加源文件路径 | `file_path_column=「__path」` | [#22] |\n\n## 常见失败 & 对应排查点\n\n| 现象 | 根因 | 跳到 |\n|---|---|---|\n| `TableVersionNotFoundError` | 表没 create 过,或者 namespace 拼错 | [#6] |\n| `SchemaValidationError: column X not in table version` | `columns=[...]` 里有 typo / 大小写错 | [#15] |\n| `DatasetType.LANCE` 读报 KeyError | `TABLE_TYPE_TO_READER_FUNC` 里根本没这个 key | [#19] |\n| 读出来是 `list` 不是 `pa.Table` | 走到了 `PYARROW_PARQUET` lazy 分支 | [#8] |\n| Distributed read 卡住 / 不并行 | Ray 没 init / max_parallelism 没传 | [#13] |\n\n---\n\n## 和 Chapter 2 (写) 的镜像关系\n\n写(Chapter 2):**内存 Table → bytes 落盘 → 生成 Manifest → commit 到 catalog**\n读(本 tour): **catalog 里读 Manifest → 拿路径 → bytes 读入内存 → 拼成 Table**\n\nManifest 是两条路径的汇合点。写的时候 `ManifestEntry.from_path` 把物理文件登记成逻辑条目;读的时候 [#18] 把 entry.url 解出来扔给 reader。\n\n## 和 Chapter 5 (Lance) 的关系\n\n> 🚪 **Chapter 5 会解释:** [#19] 里 `TABLE_TYPE_TO_READER_FUNC` **故意**没给 `DatasetType.LANCE` 注册 reader。Lance 的目录结构太不一样(一个 delta 是一个目录,不是一个文件),硬塞进这张 dispatch 表会破坏假设。`experiments/02_read_local.py` 的做法是:只用 DeltaCat 的 catalog 拿到 Lance 目录路径,然后**绕开** DeltaCat 的读路径,直接 `lance.dataset(path)`。所以本 tour 不会在这里追到 Lance——它就不该出现。\n",
+  "steps": [
+    {
+      "title": "导读: 读路径要做什么",
+      "description": "**这一章讲什么:** DeltaCat 标准 (Parquet) 读路径的端到端追踪——`dc.read_table(...)` 从用户调用开始,到返回一个 `pa.Table` / Pandas / Daft / Ray Dataset 的全过程。\n\n**一句话总结:** 「读 = 沿 Manifest 反解」。Chapter 2 写的时候,最后产出了一份 **Manifest**(文件清单,见 [Chapter 1 的 Manifest 步骤][1 - DeltaCat 框架分层总览#16])——读的时候就是把这份清单拿出来,逐条解回数据。\n\n**本 tour 追的「具体调用」:**\n```python\nimport deltacat as dc\nfrom deltacat.types.media import DatasetType\ndf = dc.read_table(\n    table=「users」,\n    namespace=「demo」,\n    read_as=DatasetType.PYARROW,   # 本次取值 — 走本地路径\n    columns=[「id」, 「name」],\n)\n```\n\n- `read_as=PYARROW`(本次)→ `DatasetType.local()` → `StorageType.LOCAL` → `_download_delta_local`\n- 对照的「另一支」:`read_as=DAFT` / `RAY_DATASET` → `DatasetType.distributed()` → `_download_delta_distributed`(Ray 集群并行读)\n\n**不讲什么(避免跑题):**\n- Lance thin-client 读(Chapter 5 讲)——本 tour 在 [#19] 会给一个提示,但不深挖。\n- Ray Data 的 `dc.read_deltacat(...)` 入口(那是另一个 API,在 `deltacat/io/__init__.py`)——只在收束时一笔带过。\n- Compaction(读路径没它)。\n\n**阅读顺序建议:** 先读左侧的 `overview` 面板看全貌,再按 [#2] [#3] [#4] ... 一步一步跟。"
+    },
+    {
+      "file": "deltacat/__init__.py",
+      "line": 33,
+      "title": "Entry: `deltacat/__init__.py` re-export `read_table`",
+      "tags": ["Entry", "role:entry", "priority:P2"],
+      "color": "#3b82f6",
+      "description": "**这行做什么:** 把底层 `deltacat.catalog.read_table` 放到顶层包,这样用户 `import deltacat as dc` 之后可以直接写 `dc.read_table(...)`。\n\n这是一层纯语法糖,没有任何业务逻辑。\n\n**旁边一行的小彩蛋:** 文件 115 行左右还有 `read = read_table`——多提供一个短别名 `dc.read(...)`,和 `dc.read_table(...)` 等价。写和读都是这个套路(对照 Chapter 2 [#2])。"
+    },
+    {
+      "file": "deltacat/catalog/__init__.py",
+      "line": 14,
+      "title": "Entry: `deltacat/catalog/__init__.py` 再次 re-export",
+      "tags": ["Entry", "role:entry", "priority:P3"],
+      "color": "#9ca3af",
+      "description": "**这一行做什么:** catalog 子包从 `delegate` 里拿到 `read_table`,再暴露出去。\n\n链条是:\n```\ndeltacat (顶层)           — [#2] 这里 import\n  └─ catalog (子包)        — [#3] 这里 import\n       └─ delegate         — 真正的多 catalog 路由(按 catalog 名字找实现)\n            └─ catalog.main.impl.read_table   — [#4] 本 tour 主角\n```\n\n**为什么要多一层 `delegate`?** DeltaCat 支持多个 catalog 后端(native / Iceberg / 自定义)。`delegate.read_table` 按 `catalog=「...」` 参数挑实现,然后转发。本 tour 默认用 native catalog (`catalog.main.impl`),`delegate` 里那层 switch 跳过了——就是个一行转发,不值得单独占一步。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1637,
+      "location": "read_table",
+      "title": "Catalog 层: `read_table` 入口——读流程的编排器",
+      "tags": ["Catalog 层", "role:main", "priority:P1"],
+      "color": "#f59e0b",
+      "description": "**这个函数做什么:** 整条读路径的**编排器(orchestrator)**。它自己不读字节、不解 Parquet,只负责按顺序调四个大步骤,把结果串起来。\n\n**关注逻辑:** 这个函数按下面顺序做 4 件事,每件都是一个独立子过程:\n\n1. **setup transaction** (下一步 [#5]) — 给整次读包一个一致性窗口,避免读到一半元数据被改。\n2. **resolve table_version** ([#6]) — 没指定版本就取最新 active 版本;拿到的 `table_version_obj` 里含 schema,下游要用。\n3. **qualify deltas** ([#7]) — 按 `partition_filter` 找出要读的 delta 列表。\n4. **download & process** ([#9]) — 真正去 storage 层拿数据,装成用户要的 dataset 类型。\n\n**关注变量:**\n\n| 名字 | 第一次出现 | 作用 |\n|---|---|---|\n| `read_as` | 入参 | 决定返回的内存类型,**后面 [#13] 的分支全靠它** |\n| `table_version_obj` | [#6] | 携带 schema;[#10] 判断 schemaless 走不走 schema 处理 |\n| `qualified_deltas` | [#7] | 要读的 delta 列表;[#12] 会合并它们 |\n| `partition_filter` | 入参 | 控制读哪些 partition;默认 None = 全读 |\n| `columns` | 入参 | 列投影;一直传到 Storage 层做校验 |\n\n**本次取值:**\n- `table=「users」`, `namespace=「demo」`, `table_version=None`(= 最新 active)\n- `read_as=DatasetType.PYARROW` —— 这是本 tour 的主线 branch\n- `partition_filter=None` — 全部 partition 都读\n- `columns=[「id」, 「name」]` — 只要两列\n- `max_parallelism=None` — 由后面 [#18] 默认给 1(本地 serial)或 100(distributed)"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1671,
+      "location": "read_table",
+      "title": "Catalog 层: 起 transaction 包裹整次读",
+      "tags": ["Catalog 层", "role:main", "priority:P2"],
+      "color": "#3b82f6",
+      "description": "**这一步做什么:** 给整次读操作包一个 **transaction**(事务)窗口——如果用户没外面传 transaction,就新起一个内部 transaction,读完在 finally 里 `seal()`。\n\n**为什么需要:** 读多个 delta 时,元数据得在同一个「时间快照」下是一致的。如果中途有 compaction 在改 catalog,不包 transaction 可能读到半新半旧的状态。\n\n**本次取值:** 用户没传 `transaction=...`,所以 `read_transaction` 是新建的,`commit_transaction=True`(在 [#4] 看到的 finally 块里会 seal)。\n\n**对照 Chapter 2 [#8]:** 写路径也是类似套路——`setup_transaction` 是读写公用的 helper。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1678,
+      "location": "read_table",
+      "title": "Catalog 层: 解析 `table_version_obj`(含 schema)",
+      "tags": ["Catalog 层", "role:main", "priority:P2"],
+      "color": "#3b82f6",
+      "description": "**这一步做什么:** 按 `(namespace, table, table_version)` 去 catalog 查出一个 `TableVersion` 对象。里面最重要的字段是 `schema`——后面 [#10] 要用它判断是不是 schemaless 表,[#23] 要用它做 schema coercion。\n\n**关注逻辑:** 函数定义在本文件 line 2683(`_get_latest_active_or_given_table_version`)。它的分支很简单——`table_version is None` → 取最新 active 版本;否则按名字取。**本次取值 `table_version=None`,所以取最新 active。**\n\n**失败怎么处理:** 查不到会抛 `TableVersionNotFoundError`——这是读路径最常见的错误之一:「表根本没建过」或者「namespace 拼错了」。在 overview 的「常见失败」表里有收录。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1686,
+      "location": "read_table",
+      "title": "Catalog 层: 调 `_get_qualified_deltas_for_read` —— 找出要读哪些 delta",
+      "tags": ["Catalog 层", "role:call-site", "priority:P2"],
+      "color": "#3b82f6",
+      "description": "**这一步做什么:** 把「按 partition filter 找要读哪几个 delta」这件事抽出去。函数定义在本文件 line 1355,body 很短,本 tour 不深挖;关键事实是:\n\n```\npartition_filter=None  →  _get_all_committed_partitions (取所有已提交 partition)\n                     ↓\n              _get_deltas_from_partition_filter\n                     ↓\n              List[Delta]  (按 partition → 按 delta 排好)\n```\n\n**关注逻辑:** 返回的 `qualified_deltas: List[Delta]` 就是「本次读要处理的 delta 列表」,每个 delta 自带它那次写入的 manifest(文件清单)。\n\n**本次取值:** 假设 demo.users 上只有 Chapter 2 写过 1 次 → `len(qualified_deltas) == 1`。实际生产中可能十几个——compaction 之前每次 append 都是一个 delta。\n\n**这些 delta 的命运:** [#12] 把它们合成一个 `merged_delta`;[#14] 把 `merged_delta` 交给 storage 层下载。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1696,
+      "location": "read_table",
+      "title": "Catalog 层: PYARROW_PARQUET 特殊分支 — 强制 parallelism=1",
+      "tags": ["Catalog 层", "role:branch-skipped", "priority:P3"],
+      "color": "#9ca3af",
+      "description": "**这一段做什么:** 如果 `read_as == DatasetType.PYARROW_PARQUET`,把 `max_parallelism` 强制改成 1。**本次 `read_as=PYARROW`,这个 `if` 不成立,直接跳过。**\n\n**为什么要这个 hack:** `PYARROW_PARQUET` 模式返回的是 `pa.parquet.ParquetFile` 对象(lazy,懒加载,文件句柄),不是物化的 `pa.Table`。这东西还没有自定义的 SerDe,多进程之间 pickle 传不过去。所以暂时只允许 serial 读。代码上面的 `TODO(pdames)` 留了注释。\n\n**为什么算 P3:** 它是条「不走到」的分支,对主线 `PYARROW` 分支无影响。\n\n**和 [#13] 的关系:** [#13] 决定 `LOCAL` / `DISTRIBUTED`;这里 [#8] 决定 parallelism 的细节。两个独立旋钮。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1701,
+      "location": "read_table",
+      "title": "Catalog 层: 调 `_download_and_process_table_data`",
+      "tags": ["Catalog 层", "role:call-site", "priority:P2"],
+      "color": "#3b82f6",
+      "description": "**这一步做什么:** 把刚才准备好的一切(deltas 列表、表版本、用户要的类型、列投影)全部传给 `_download_and_process_table_data` —— 下一步 [#10] 跳进去看细节。\n\n这是 `read_table` 最后一步,拿到返回值直接 return(try/finally 收尾 transaction)。\n\n**参数清单:**\n- `namespace, table` — 用于日志\n- `qualified_deltas` — 要读的 delta 列表\n- `read_as=PYARROW` — 决定走哪个子路径\n- `max_parallelism=None` — 后面 [#18] 按 local/distributed 填默认值\n- `columns=[「id」, 「name」]`\n- `file_path_column=None`\n- `table_version_obj` — 携带 schema,`_handle_schemaless_table_read` / `_handle_local_table_concatenation` 都用它"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1441,
+      "location": "_download_and_process_table_data",
+      "title": "Catalog 层: `_download_and_process_table_data` 入口 —— 真正的下载编排",
+      "tags": ["Catalog 层", "role:main", "priority:P1"],
+      "color": "#f59e0b",
+      "description": "**这个函数做什么:** 从 delta 列表开始,一路把数据读成用户要的 dataset 类型。是 [#4] 编排器的主要「干活」部分。\n\n**关注逻辑:** 分 5 小段,按顺序:\n1. **NUMPY 翻译成 PANDAS**(内部统一走 pandas pipeline,最后再转 numpy,见本次调用不走)\n2. **空 `qualified_deltas` → 返回空表短路**(见 line 1462)\n3. **schemaless 表**(`table_version.schema is None`)走 `_handle_schemaless_table_read` —— 本 tour 跳过,下一步说明\n4. **正常路径:** `Delta.merge_deltas` ([#12]) → `_get_storage().download_delta(...)` ([#14])\n5. **收尾:** `_handle_local_table_concatenation` ([#22]),或对 NUMPY 做 pandas→numpy 转换\n\n**关注变量:**\n\n| 名字 | 第一次出现 | 作用 |\n|---|---|---|\n| `original_read_as` | line 1455 | 记 NUMPY 请求,用于最后转换 |\n| `effective_read_as` | line 1456 | NUMPY 会被翻译成 PANDAS,内部用它 |\n| `merged_delta` | [#12] | 合并后的单个 delta,带合并后的 manifest |\n| `table_type` | [#13] | 传给 storage 层的本地类型 |\n| `distributed_dataset_type` | [#13] | distributed 时才非 None |\n| `storage_type` | [#14] 调用点 | `LOCAL` 或 `DISTRIBUTED`,决定 dispatch |\n\n**本次取值:**\n- `original_read_as = effective_read_as = PYARROW`(没 NUMPY 翻译)\n- `qualified_deltas` 非空,跳过 empty 短路\n- `table_version_obj.schema` 非空(Chapter 2 用 pyarrow.Table 写,schema 推断出来了),跳过 schemaless 分支\n- 本 tour 走第 4/5 段主线"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1466,
+      "location": "_download_and_process_table_data",
+      "title": "Catalog 层: schemaless 表分支 —— 本次跳过",
+      "tags": ["Catalog 层", "role:branch-skipped", "priority:P3"],
+      "color": "#9ca3af",
+      "description": "**这一段做什么:** 如果表建的时候没给 schema(schemaless table),走另一条路——把 manifest 条目直接摊平成一张「含 url / 大小 / 记录数」的元数据表返回,而**不是**读底层文件字节。\n\n**本次取值:** `table_version_obj.schema` 非空(Chapter 2 写数据时 pyarrow.Table 自带 schema),`if table_version_obj.schema is None:` 不成立,**跳过**整段,直奔下面的 standard path。\n\n**什么场景会走这里:** 用户纯用 `from_manifest_table(...)` 建一个 schemaless 表,只记录「哪些文件属于我」,不规定内容结构。读的时候只想看「有哪些文件」。对这个 tour 的主线不相关。\n\n函数定义在本文件 line 1407,感兴趣可自行查阅。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1479,
+      "location": "_download_and_process_table_data",
+      "title": "Catalog 层: `Delta.merge_deltas` 把 N 个 delta 合成一个",
+      "tags": ["Catalog 层", "role:main", "priority:P2"],
+      "color": "#3b82f6",
+      "description": "**这一行做什么:** 把 [#7] 里的 `List[Delta]` 合成一个「逻辑上的大 delta」—— 具体就是把所有 delta 的 manifest entries 按顺序 concat 起来,外面包一层 `Delta`。\n\n**为什么要合并:** 下游(storage / types)只需要「一份文件清单」,不需要再区分「这个文件是第几个 delta 来的」。合成一个 `merged_delta` 之后,整条路径简化为「一个 manifest → 一堆文件 → 读」,大大减少下游代码复杂度。\n\n**函数定义:** `deltacat/storage/model/delta.py` line 67。文档字符串指出合并要求:\n- 同 partition\n- 同 delta type(ADD 和 APPEND 可以一起合成 ADD)\n- 都有非空 manifest\n\n**本次取值:** 假设只有 1 个 delta,`merge_deltas` 实际上是个 pass-through(也会正常输出,不会报错)。多个 delta 的情况下,产出一个单 delta,manifest entries 按输入顺序拼接。\n\n**对照 Chapter 2(写路径 tour):** 写的时候一个 delta 就一个 manifest;读的时候反过来,把多个 manifest 拍扁成一个。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1482,
+      "location": "_download_and_process_table_data",
+      "title": "Catalog 层: ⚡ 决定 LOCAL vs DISTRIBUTED —— 读路径的关键 fork",
+      "tags": ["Catalog 层", "role:branch-taken", "priority:P0"],
+      "color": "#ef4444",
+      "description": "**这几行做什么:** 根据 `effective_read_as` 是落在 `DatasetType.local()` 还是 `DatasetType.distributed()` 集合里,填两个变量:\n\n```python\ntable_type = (\n    effective_read_as\n    if effective_read_as in DatasetType.local()\n    else (kwargs.pop(「table_type」, None) or DatasetType.PYARROW)\n)\ndistributed_dataset_type = (\n    effective_read_as if effective_read_as in DatasetType.distributed() else None\n)\n```\n\n然后在下面 [#14] 的 `download_delta` 调用点用:\n```python\nstorage_type = StorageType.DISTRIBUTED if distributed_dataset_type else StorageType.LOCAL\n```\n\n**为什么这是 P0:** 这是整条读路径最重要的分岔,一错误判断后面全错。`storage_type` 决定了 [#16] 里那张 dispatch dict 走哪一边,也决定了 [#19] vs [#20] 到底用哪张 reader 表。\n\n**本次取值(全程展开):**\n- `effective_read_as = DatasetType.PYARROW`\n- `DatasetType.local() = {NUMPY, PANDAS, POLARS, PYARROW, PYARROW_PARQUET}` —— **`PYARROW in local()` = True**\n- `DatasetType.distributed() = {DAFT, RAY_DATASET}`\n- 因此 `table_type = PYARROW`,`distributed_dataset_type = None`\n- 后面 `storage_type = StorageType.LOCAL`(本 tour 主线)\n\n**对照分支 `read_as=DAFT`:**\n- `table_type = DatasetType.PYARROW`(fallback 默认)\n- `distributed_dataset_type = DAFT`\n- `storage_type = StorageType.DISTRIBUTED` → 转 [#16] 另一支 `_download_delta_distributed`"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1521,
+      "location": "_download_and_process_table_data",
+      "title": "Catalog 层: 调 `storage.download_delta(merged_delta, ...)`",
+      "tags": ["Catalog 层", "role:call-site", "priority:P1"],
+      "color": "#f59e0b",
+      "description": "**这一步做什么:** 把 `merged_delta` 交给 Storage 层,说「按这份清单给我读出来」。参数里 `storage_type` 就是 [#13] 决定的 `LOCAL` / `DISTRIBUTED`——storage 层用它去 dispatch。\n\n**关注参数:**\n- `merged_delta` — 待读的 delta(含合并后的 manifest)\n- `table_type=effective_read_as=PYARROW` — 传给 reader 用\n- `storage_type=StorageType.LOCAL` ← **本次取值,重点**\n- `max_parallelism` — 由 [#14] 上一行 `_get_max_parallelism` 算出:本 tour 是 local + 用户没传 → 默认 1\n- `columns=[「id」, 「name」]` — 列投影\n- `distributed_dataset_type=None` — 本次是 local,不用这个\n- `file_path_column=None`\n\n**返回值:** 按 storage_type 不同,`result` 是 `List[pa.Table]`(LOCAL)或 `DistributedDataset`(DISTRIBUTED)。本次是前者,一个 Table 一张——下面 [#22] 会 concat。\n\n**下一步 [#15]:** 跳进 storage 层看 `download_delta`。"
+    },
+    {
+      "file": "deltacat/storage/main/impl.py",
+      "line": 946,
+      "location": "download_delta",
+      "title": "Storage 层: `download_delta` 入口 —— 按 storage_type 分派",
+      "tags": ["Storage 层", "role:main", "priority:P1"],
+      "color": "#f59e0b",
+      "description": "**这个函数做什么:** Storage 层的公共读 API。职责非常聚焦:\n\n1. **拿到 manifest**(如果 delta 带了就直接用,否则去 catalog 取 —— line 998-1010)\n2. **列校验**:`columns` 里的列名都得在 schema 里(line 1028-1046)\n3. **按 `storage_type` 分派**到 `_download_delta_local` 或 `_download_delta_distributed`(下一步 [#16])\n4. **(如果是自己起的 transaction)seal 掉**\n\n**关注逻辑:** 这个函数自己**不读任何字节**——它是 storage 层的 router,把实际工作交给两个 helper 之一。这是 DeltaCat 常见套路:每层都有一个「公共入口 + 按类型分派到 private helper」的结构。\n\n**关注变量:**\n\n| 名字 | 第一次出现 | 作用 |\n|---|---|---|\n| `delta_like` | 入参 | 可以是 `Delta`(带 manifest)或 `DeltaLocator`(不带) |\n| `manifest` | line 999 or 1005 | 文件清单;下游函数的真正输入 |\n| `all_column_names` | line 1022 | 从 schema 推出来的完整列名,给 reader 用 |\n| `storage_type` | 入参 | 分派键:`LOCAL` / `DISTRIBUTED` |\n| `dataset` | line 1070 | 返回值,类型随分派变 |\n\n**本次取值:**\n- `delta_like = merged_delta`(`isinstance(., Delta) = True`)\n- `merged_delta.manifest` 非空 → 直接用,**不用再去 catalog fetch**(line 998 分支)\n- `storage_type = StorageType.LOCAL`\n- `all_column_names = [「id」, 「name」, ...]` 来自 `get_table_version_schema`\n- `columns=[「id」, 「name」]` 校验通过"
+    },
+    {
+      "file": "deltacat/storage/main/impl.py",
+      "line": 978,
+      "location": "download_delta",
+      "title": "Storage 层: ⚡ dispatch dict → `_download_delta_local`",
+      "tags": ["Storage 层", "role:dispatch", "priority:P0"],
+      "color": "#ef4444",
+      "description": "**这几行做什么:** 用一个小 dispatch dict 把 `storage_type` 映射到对应的 private 实现函数:\n\n```python\nstorage_type_to_download_func = {\n    StorageType.LOCAL: _download_delta_local,\n    StorageType.DISTRIBUTED: _download_delta_distributed,\n}\n```\n\n然后在 line 1070:\n```python\ndataset = storage_type_to_download_func[storage_type](manifest, ...)\n```\n\n**为什么这是 P0:** 这是读路径第二个「关键开关」(第一个是 [#13] 决定 storage_type)。一个 dict lookup,表面看简单,但决定了「本地 multiprocessing」还是「Ray 集群分布式」两条完全不同的执行路径。\n\n**本次取值:**\n- `storage_type = StorageType.LOCAL`\n- dispatch → **`_download_delta_local`** —— 下一步 [#17] 跳进去\n\n**对照分支 `DISTRIBUTED`:** 会走 `_download_delta_distributed`(本文件 line 893),最终调 `download_manifest_entries_distributed`(types/tables.py line 1966)。[#20] 会对照着讲一下那张表。"
+    },
+    {
+      "file": "deltacat/storage/main/impl.py",
+      "line": 924,
+      "location": "_download_delta_local",
+      "title": "Storage 层: `_download_delta_local` —— 一层薄包装",
+      "tags": ["Storage 层", "role:utility-dive", "priority:P2"],
+      "color": "#3b82f6",
+      "description": "**这个函数做什么:** 一层薄薄的转发。除了把 `max_parallelism` 没给时兜底成 1、重排一下参数顺序,几乎没有业务逻辑。真正干活的是它调的 `download_manifest_entries`(在 types 层,[#18] 进去看)。\n\n**签名:** `_download_delta_local(manifest, table_type, max_parallelism, column_names, include_columns, file_reader_kwargs_provider, **kwargs) -> LocalDataset`,返回 `List[LocalTable]`(每个 manifest entry 一张 table)。\n\n**为什么是独立一步而不是跳过:** 展示 Storage 和 Types 的分层边界——Storage 管「按 storage_type 分派」,Types 管「按 table_type / content_type 读字节」。两层职责分明:这个函数正好在交接处,是一个很直观的「我把活交给你」瞬间。\n\n**本次取值:**\n- `manifest`: 来自 [#15] 拿到的那份,entries 是 Chapter 2 落盘的 `.parquet` 路径们\n- `table_type = DatasetType.PYARROW`\n- `max_parallelism = 1`(默认,没传)\n- `column_names = [「id」, 「name」, ...]`(从 schema 推出来的全集)\n- `include_columns = [「id」, 「name」]`(用户想要的子集)\n\n**对照分支:** `_download_delta_distributed` 在本文件 line 893,形状差不多,只是调的是 `download_manifest_entries_distributed`。"
+    },
+    {
+      "file": "deltacat/types/tables.py",
+      "line": 1808,
+      "location": "download_manifest_entries",
+      "title": "Types 层: `download_manifest_entries` —— serial / parallel 分支",
+      "tags": ["Types 层", "role:main", "priority:P1"],
+      "color": "#f59e0b",
+      "description": "**这个函数做什么:** 遍历 `manifest.entries`,把每条 entry 读成一张 local table,返回一个 `List[LocalTable]`。**是不是用多进程并行,由 `max_parallelism` 控制。**\n\n**关注逻辑:**\n```python\nif max_parallelism and max_parallelism <= 1:\n    return _download_manifest_entries(...)           # serial: 简单 for 循环\nelse:\n    return _download_manifest_entries_parallel(...)  # multiprocessing.Pool\n```\n\n两支最终都走 `download_manifest_entry`(单文件读,line 2280)→ `read_file`(line 2359)→ 查 **TABLE_TYPE_TO_READER_FUNC** 拿到 reader 函数 → 真正打开字节。这条尾链是 [#21] 讲的重点。\n\n**关注变量:**\n\n| 名字 | 第一次出现 | 作用 |\n|---|---|---|\n| `manifest.entries` | 入参 | 文件清单,for 循环每条一次 |\n| `max_parallelism` | 入参 | ≤1 serial,>1 用 Pool |\n| `table_type` | 入参 | 传给下游 reader dispatch |\n| `column_names` | 入参 | 完整列名(给 reader 做 schema 推断) |\n| `include_columns` | 入参 | 列投影(reader 只读这几列) |\n\n**本次取值:**\n- `max_parallelism = 1` → 走 **serial** 分支(`_download_manifest_entries`, line 1857)\n- 主循环在 line 1890:`for e in manifest.entries: ... download_manifest_entry(manifest_entry=..., **download_args)`\n- 每次循环出一张 `pa.Table`,累计进 `result: List`,返回\n\n**parallel 分支 (`_download_manifest_entries_parallel`, line 2230)** 用 `multiprocessing.Pool(max_parallelism).map(...)`,形状一样,只是并发。Ray 不在这里出现——Ray 路径走 distributed 分支,[#20] 对照。"
+    },
+    {
+      "file": "deltacat/types/tables.py",
+      "line": 107,
+      "location": "TABLE_TYPE_TO_READER_FUNC",
+      "title": "Types 层: ⚡ `TABLE_TYPE_TO_READER_FUNC` —— 按内存类型选 reader",
+      "tags": ["Types 层", "role:dispatch", "priority:P0"],
+      "color": "#ef4444",
+      "description": "**这张 dict 做什么:** 把「用户想要的内存类型」(`DatasetType`)映射到「读文件的 reader 函数」。是整条本地读路径的**最终分派点**。\n\n```python\nTABLE_TYPE_TO_READER_FUNC: Dict[str, Callable] = {\n    DatasetType.PYARROW_PARQUET.value: pa_utils.file_to_parquet,\n    DatasetType.PYARROW.value:         pa_utils.file_to_table,    # ← 本次命中\n    DatasetType.PANDAS.value:          pd_utils.file_to_dataframe,\n    DatasetType.NUMPY.value:           np_utils.file_to_ndarray,\n    DatasetType.POLARS.value:          pl_utils.file_to_dataframe,\n}\n```\n\n**用的位置:** line 2389 的 `read_file` 函数里(下一步 [#21])—— `reader = TABLE_TYPE_TO_READER_FUNC[table_type.value]`,然后 `reader(path, content_type, ...)`。\n\n**为什么这是 P0:** 这里把「**想要什么内存类型**」和「**文件长什么样**」解耦——dict 选出的 reader 负责把 bytes 变成对应 Python 对象;再由 reader 自己按 `content_type` (Parquet/CSV/JSON) 决定用哪个格式 handler。两个维度正交,代码可读性好。\n\n**本次取值链:**\n```\nDatasetType.PYARROW.value == 「pyarrow」\n  → TABLE_TYPE_TO_READER_FUNC[「pyarrow」] = pa_utils.file_to_table\n  → 到 [#21] 调 file_to_table(path, 「parquet」, 「identity」, ...)\n  → 内部看到 content_type=「parquet」,走 papq.read_table 分支\n  → 返回 pa.Table\n```\n\n> 🚪 **给 Chapter 5 的彩蛋:** 这张 dict **没有** `DatasetType.LANCE` 的 entry —— 故意的,不是 bug。Lance 的一个「文件」其实是一个目录(里面多个 fragment + 索引),塞不进这张表「一个 path → 一个 reader」的模型。`experiments/02_read_local.py` 的做法是:只用 DeltaCat catalog 取路径,然后**绕开** DeltaCat 读路径,直接 `lance.dataset(path)`。Chapter 5 会完整讲这个选择的原因。\n\n**对照 distributed 分支:** [#20] 讲 `DISTRIBUTED_DATASET_TYPE_TO_READER_FUNC`(line 542)—— 只有 DAFT 一个 entry(RAY_DATASET 走另一条 code path)。两张表都是「按类型选 reader」套路,但内容不同。"
+    },
+    {
+      "file": "deltacat/types/tables.py",
+      "line": 542,
+      "location": "DISTRIBUTED_DATASET_TYPE_TO_READER_FUNC",
+      "title": "Types 层: distributed 分支的 reader 表(对照)",
+      "tags": ["Types 层", "role:branch-skipped", "priority:P3"],
+      "color": "#9ca3af",
+      "description": "**这张 dict 做什么:** 和 [#19] 对照看——distributed 路径用的 reader 分派表。**本次 tour 的 `read_as=PYARROW` 不走这里**,仅作对照。\n\n```python\nDISTRIBUTED_DATASET_TYPE_TO_READER_FUNC: Dict[int, Callable] = {\n    DistributedDatasetType.DAFT.value: _daft_reader_wrapper,\n}\n```\n\n**只有一个 entry** `DAFT`。`RAY_DATASET` 去哪了?—— Ray 路径在 `download_manifest_entries_distributed`(line 1966)里直接写死分支,调 `_download_manifest_entries_ray_data_distributed`(line 2064),不查这张表。设计不太对称,但读路径如此。\n\n**什么时候会用到这张表:**\n- `read_as=DAFT` → 走 [#13] 的 DISTRIBUTED 分支 → `_download_delta_distributed`(storage/main/impl.py line 893)→ `download_manifest_entries_distributed`(line 1966)→ 命中 `DAFT.value` 这个 entry,调 `_daft_reader_wrapper`(line 535)→ 最终调 `deltacat/utils/daft.py::files_to_dataframe`。\n\n**跳回 [#19]:** 本次 tour 的主线 reader 分派是 `TABLE_TYPE_TO_READER_FUNC[「pyarrow」] = pa_utils.file_to_table`。"
+    },
+    {
+      "file": "deltacat/types/tables.py",
+      "line": 2389,
+      "location": "read_file",
+      "title": "Types 层: `read_file` —— 真正调 reader 的那一行",
+      "tags": ["Types 层", "role:main", "priority:P1"],
+      "color": "#f59e0b",
+      "description": "**这个函数做什么:** 把 [#19] 讲的 dispatch 表和真正读字节的瞬间接起来。每条 manifest entry 最终都会流到这里,然后:\n\n```python\nreader = TABLE_TYPE_TO_READER_FUNC[table_type.value]\ntable = reader(path, content_type.value, content_encoding.value, filesystem, ...)\n```\n\n外面还包了一层 `@retrying`(重试),和一个 `categorize_errors` 装饰器把错误分成 retryable / non-retryable。\n\n**本次取值展开:**\n```\nreader  = pa_utils.file_to_table          # 从 [#19] 的 dict lookup\npath    = 「/.../demo/users/....parquet」  # 来自 ManifestEntry.url\ncontent_type     = 「parquet」              # ManifestEntry 的 meta 里记的\ncontent_encoding = 「identity」             # 无压缩\n```\n\n`pa_utils.file_to_table` 定义在 `deltacat/utils/pyarrow.py` line 1308。它内部看 `content_type`——是 parquet 就调 `pa.parquet.read_table`;是 csv 就调 `pa.csv.read_csv`;etc.。字节真正进内存就在那里。\n\n**字节 → pa.Table 完成。** 这张 Table 作为单个 entry 的结果,返回到 [#18] 的 `result.append(...)`,最终成为 `List[pa.Table]` 里的一项,回到 [#14] 的 `download_delta` 返回值。\n\n**failure modes:** retry 包了网络抖动;文件不存在会在 `@categorize_errors` 里转成 `NonRetryableDownloadTableError`(line 2403-)。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1535,
+      "location": "_download_and_process_table_data",
+      "title": "Catalog 层: `result` 是 list —— 该 concat 了",
+      "tags": ["Catalog 层", "role:branch-taken", "priority:P1"],
+      "color": "#f59e0b",
+      "description": "**这一段做什么:** Storage 层返回 `List[pa.Table]`(一个 manifest entry 一张)。本地读要把它们合成一张大 Table 给用户——这里的 `if` 判断决定要不要做合并。\n\n**关注逻辑:**\n```python\nif not distributed_dataset_type and table_type and isinstance(result, list):\n    if table_type == DatasetType.PYARROW_PARQUET:\n        return result[0] if len(result) == 1 else result   # lazy,不 concat\n    else:\n        result = _handle_local_table_concatenation(...)      # 本次走这里\n```\n\n**本次取值:**\n- `distributed_dataset_type = None` → `not None = True` ✓\n- `table_type = DatasetType.PYARROW` → truthy ✓\n- `isinstance(result, list) = True` ✓\n- 内层 `table_type == PYARROW_PARQUET`? **否**,`PYARROW != PYARROW_PARQUET`\n- → 走 else 分支,调 `_handle_local_table_concatenation` —— 下一步 [#23]\n\n**为什么 PYARROW_PARQUET 不 concat:** 它返回的是 `pa.parquet.ParquetFile`(懒加载的文件句柄),不是 `pa.Table`。要保持「lazy」语义,所以多个 ParquetFile 就用 list 返回,让用户自己按需 read。**本次不走这个分支**,但要记住它的存在。\n\n**DISTRIBUTED 路径:** 不走这个 `if`(`distributed_dataset_type` 非 None),直接把 `DistributedDataset` 返回给用户,由 Ray / Daft 自己管 lazy/eager。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 1608,
+      "location": "_handle_local_table_concatenation",
+      "title": "Catalog 层: `_handle_local_table_concatenation` —— schema coerce + concat",
+      "tags": ["Catalog 层", "role:main", "priority:P2"],
+      "color": "#3b82f6",
+      "description": "**这个函数做什么:** 把 `List[LocalTable]` 揉成一张 `LocalTable` 返回给用户。分两步:\n\n1. **创建目标 schema**(line 1619):`_create_target_schema(table_schema.arrow, columns, file_path_column)` —— 挑出用户要的列、可能加个 `file_path_column`。\n2. **coerce each table**(line 1623):每张 table 按目标 schema 做 cast(schema evolution 的场景下必要)。实现在 `_coerce_results_to_schema` → `deltacat_schema.coerce(table)`。\n3. **concat**(line 1632):`concat_tables(coerced_results, table_type)` 最后拼成一张大表。\n\n**为什么需要 coerce:** 不同 delta 可能在不同时间写入,经历过 schema 演化(加列、改类型)。coerce 保证每张 table 都符合**同一个目标 schema**,这样 pa.concat_tables 才不会报 schema mismatch。\n\n**本次取值:**\n- `table_schema.arrow` = 来自 `table_version_obj.schema` 的 arrow schema\n- `columns = [「id」, 「name」]` → `target_schema` 只有这两个 field\n- `file_path_column = None` → 不加额外列\n- `coerced_results`: 每张表都只保留 id / name 两列,schema 一致\n- `concat_tables(...)`: `pa.concat_tables` 拼成一张 Table\n\n**返回之后:** 回到 [#10] `_download_and_process_table_data` 的最后一段,无 NUMPY 转换 → 直接 return → [#9] 处 return → [#4] finally 里 seal transaction → 用户拿到结果。\n\n整条读路径完成。下一步 [#24] 回顾。"
+    },
+    {
+      "title": "收束 Wrap: 读路径回顾 + cheatsheet",
+      "description": "## 整条链路回放\n\n```\n用户:  dc.read_table(「users」, namespace=「demo」, read_as=DatasetType.PYARROW, columns=[「id」, 「name」])\n\n  ▼   [#2] [#3]  顶层 re-export,纯转发\n  ▼\nCatalog 层: read_table [#4]\n  ├─ setup_transaction      [#5]\n  ├─ resolve table_version  [#6]   ← 拿 schema\n  ├─ qualify deltas         [#7]   ← 拿 List[Delta]\n  └─ _download_and_process  [#9] [#10]\n       ├─ merge_deltas      [#12]  ← List[Delta] → Delta(合并 manifest)\n       ├─ 分支 LOCAL        [#13]  ⚡ P0 关键 fork\n       └─ storage.download_delta(merged_delta, storage_type=LOCAL, ...)  [#14]\n               │\n               ▼\nStorage 层: download_delta [#15]\n  └─ dispatch_dict[LOCAL]  [#16]  ⚡ P0 → _download_delta_local\n       └─ _download_delta_local [#17]\n            └─ download_manifest_entries(manifest, PYARROW, ...)  [#18]\n                   │\n                   ▼\nTypes 层: download_manifest_entries [#18]  (serial, 本次 parallelism=1)\n  └─ for each entry:\n       download_manifest_entry → read_file [#21]\n            └─ reader = TABLE_TYPE_TO_READER_FUNC[「pyarrow」]  [#19]  ⚡ P0\n                     = pa_utils.file_to_table\n            → 按 content_type=「parquet」 调 papq.read_table\n            → bytes → pa.Table (单个 entry 的结果)\n  ◀── List[pa.Table] 上浮\n\n回到 Catalog 层:\n  └─ isinstance(result, list) ✓  [#22]\n       → _handle_local_table_concatenation [#23]\n             → schema coerce → pa.concat_tables\n             → 一张 pa.Table 返回用户\n```\n\n## 和写路径 (Chapter 2) 的对仗\n\n| 阶段 | 写 (Ch.2) | 读 (本 tour) |\n|---|---|---|\n| 用户入口 | `dc.write_to_table` | `dc.read_table` [#4] |\n| Catalog 编排 | `write_to_table` orchestrator | `read_table` + `_download_and_process_table_data` |\n| Storage 入口 | `stage_delta` | `download_delta` [#15] |\n| Storage 私有实现 | `_write_table` | `_download_delta_local` [#17] |\n| Types dispatch | `TABLE_CLASS_TO_WRITER_FUNC` | `TABLE_TYPE_TO_READER_FUNC` [#19] |\n| 底层 IO | `papq.write_table` | `papq.read_table`(包在 `pa_utils.file_to_table` 里 [#21]) |\n| 元数据产物 / 起点 | **Manifest** | **Manifest** |\n\n两条路径**对称对称再对称**。Manifest 是锚点:写把它产生,读把它消费。\n\n## 读路径的三张 dispatch 表(记忆锚点)\n\n| dispatch 在哪 | key | 值 | 决定什么 |\n|---|---|---|---|\n| [#13] 条件分支 | `read_as` 是否 in `DatasetType.local()` / `distributed()` | `StorageType.LOCAL` / `DISTRIBUTED` | 走本地还是分布式 |\n| [#16] `storage_type_to_download_func` | `StorageType` | `_download_delta_local` / `_download_delta_distributed` | Storage 层路由 |\n| [#19] `TABLE_TYPE_TO_READER_FUNC` | `DatasetType.value`(string) | reader 函数(`file_to_table` / `file_to_dataframe` / ...) | 最终读字节用什么库 |\n\n三张表串起来 = 「用户意图 → 具体 reader 函数」的完整映射。\n\n## 彩蛋:另一个入口 `dc.read_deltacat(...)`\n\n `deltacat/io/__init__.py` 还导出一个 `read_deltacat` 函数——它是 Ray Data 集成:返回一个 Ray `Datasource`,在分布式 Ray job 里按 metadata 流读。**那是另一条路径**,不走本 tour 追的 `read_table`。入口在 `deltacat/io/reader/deltacat_read_api.py` / `deltacat/io/datasource/deltacat_datasource.py`,不在本 tour 讨论范围。\n\n## 下一步?\n\n> 🚪 **Chapter 5** 会讲 Lance thin-client 读——为什么 [#19] 的 `TABLE_TYPE_TO_READER_FUNC` **故意没有** `LANCE`,以及 `experiments/02_read_local.py` 如何用 DeltaCat catalog 取路径、再绕开 DeltaCat 读路径直接 `lance.dataset(path)`。从本 tour [#19] 出发,那是最自然的继续。"
+    }
+  ]
+}

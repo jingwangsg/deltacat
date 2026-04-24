@@ -1,0 +1,306 @@
+{
+  "$schema": "https://aka.ms/codetour-schema",
+  "title": "2 - DeltaCat 标准写入路径 (PyArrow + Parquet)",
+  "description": "跟踪 dc.write_to_table(pa.Table, content_type=PARQUET, mode=CREATE) 的完整调用链",
+  "overview": "# Tour · DeltaCat 标准写入路径 (non-Lance)\n\n本 tour 面向**大一 CS 同学**,负责**逻辑讲解**——为什么 DeltaCat 的标准写入路径要分这么多层,每一层在解决什么问题。\n配套 tour steps 负责**具体细节**:每一步里 `kwargs` 的取值、文件路径怎么拼出来、manifest entry 长啥样等等。\n每个 `[#N]` 超链接点一下,CodeTour 会跳到对应代码行。\n\n---\n\n## 这个入口在解决什么问题\n\n用户写一行:\n\n```python\nimport deltacat as dc\nimport pyarrow as pa\nfrom deltacat.types.media import ContentType\nfrom deltacat.types.tables import TableWriteMode\n\ntbl = pa.table({「id」: [1,2,3], 「name」: [「a」,「b」,「c」]})\ndc.init_local(root=「/tmp/my_catalog」)\ndc.write_to_table(\n    data=tbl,\n    table=「users」,\n    namespace=「demo」,\n    content_type=ContentType.PARQUET,\n    mode=TableWriteMode.CREATE,\n)\n```\n\nDeltaCat 要做一件看似简单、实际很讲究的事:**把这个 PyArrow Table 持久化到磁盘,并且让下次读取时能原封不动地找回来**。\n难点不在「写 Parquet 文件」本身(pyarrow 一行 `papq.write_table` 就搞定),而在:\n\n- **原子性**:写到一半崩了,半成品不能污染表。→ 靠 Transaction 包起来 [#7] [#21]。\n- **版本追踪**:同一张表被多次写入后,要能区分「第 1 次写的 3 行」vs「第 2 次写的 5 行」。→ 靠 Delta + stream_position [#22]。\n- **查询时定位数据**:表只是逻辑概念,真正的字节躺在某个 uuid 命名的文件里。→ 靠 Manifest + ManifestEntry 把逻辑 delta 和物理文件连起来 [#23] [#24]。\n\n这种「库自己决定往哪写、写成什么文件名」的风格叫 **fat-client**(胖客户端):DeltaCat 全权负责字节的去向。Chapter 3 会讲另一种玩法(Lance 的 manifest-only / thin-client),那里字节由调用方自己写,DeltaCat 只登记元数据——而那条路径的入口就是我们在 [#10] 跳过的 `if manifest is not None` 分支。\n\n## 大局观:从用户 API 到磁盘字节\n\n```\n┌─────────────────────────────────────────────────────────────────────────────┐\n│ 用户脚本                                                                     │\n│   dc.write_to_table(tbl, …, mode=CREATE, content_type=PARQUET)               │\n└──────┬──────────────────────────────────────────────────────────────────────┘\n       │ [#1] deltacat/__init__.py:38 重导出\n       │ [#2] catalog/__init__.py:19 → delegate.py\n       ▼\n┌─────────────────────────────────────────────────────────────────────────────┐\n│ Catalog 层 (deltacat/catalog/main/impl.py)                                    │\n│   write_to_table() [#6]                                                      │\n│     ├── setup_transaction                [#7]   ── 把整次调用包进一个 txn    │\n│     ├── _get_table_and_validate…         [#8]   ── 表存在吗? → False       │\n│     ├── _create_table_for_write          [#9]   ── CREATE 分支,新建表       │\n│     ├── (跳过 manifest 分支)             [#10]   ── Chapter 3 专讲这里       │\n│     ├── _handle_write_mode               [#11]  ── 决定 delta_type = APPEND  │\n│     ├── _handle_partition_creation       [#12]  ── stage 一个新 partition    │\n│     └── _stage_commit_and_compact        [#14]                               │\n└──────┬──────────────────────────────────────────────────────────────────────┘\n       ▼\n┌─────────────────────────────────────────────────────────────────────────────┐\n│ Storage 层 (deltacat/storage/main/impl.py)                                   │\n│   stage_delta                [#15]  ── 把数据写出去,建 manifest            │\n│     └─ _write_table          [#16]  ── 选写入器:pa.Table → table_to_file    │\n│        └─ _write_table_slices[#17]  ── 决定输出目录 data/<partition_id>/      │\n│           └─ write_sliced_table [#18]                                        │\n│              └─ write_table  [#19]  ── 生成 uuid 文件名                      │\n│                 └─ table_to_file [#20]                                       │\n│                    └─ write_parquet [#20]  ── papq.write_table(tbl, f)      │\n│   commit_delta               [#21]  ── 把 delta 元数据登记进 txn            │\n│   commit_partition           [#22]  ── 把 staged partition 也登记进 txn     │\n└──────┬──────────────────────────────────────────────────────────────────────┘\n       ▼\n┌─────────────────────────────────────────────────────────────────────────────┐\n│ Manifest 产物 (deltacat/storage/model/manifest.py)                           │\n│   ManifestEntry.from_path    [#23]  ── 「逻辑 delta ↔ 物理文件」的粘合剂     │\n│   Manifest.of                [#24]  ── 聚合 entries,写进 delta 的 meta     │\n└─────────────────────────────────────────────────────────────────────────────┘\n```\n\n从 [#1] 开始跟踪 →\n\n---\n\n## 什么时候调用哪一层 (速查表)\n\n| 问题 | 在哪一层回答 | 关键函数 | tour step |\n|---|---|---|---|\n| API 入口怎么对外暴露 | deltacat 包 | `deltacat/__init__.py:38` | [#1] |\n| 多后端(native / iceberg / …)怎么分发 | Catalog delegate | `delegate.py::write_to_table` | [#3] |\n| 表不存在要不要自动建 | Catalog impl | `_create_table_for_write` | [#9] |\n| 新 partition 还是沿用旧的 | Catalog impl | `_handle_partition_creation` | [#12] |\n| Parquet 字节怎么写出去 | utils.pyarrow | `write_parquet` → `papq.write_table` | [#20] |\n| 文件名谁决定 | types.tables | `UuidBlockWritePathProvider` | [#19] |\n| 写完怎么保证原子性 | storage impl + txn | `commit_delta` / `transaction.seal` | [#21] |\n| 下次怎么找到这些字节 | model.manifest | `ManifestEntry.from_path` | [#23] |\n\n## 胖 vs 瘦的关键分界 (Chapter 3 伏笔)\n\n- 胖客户端 (本 tour):DeltaCat **先写数据,再登记 manifest**。数据字节的路径由 DeltaCat 自己在 [#17] 决定 (`<root>/data/<partition_id>/<uuid>.parquet`),用户拿到的只是一个逻辑 `Delta` 对象。\n- 瘦客户端 (Chapter 3,本 tour 不讲):用户先把文件自己写好,**造一个 Manifest 对象**,然后走 [#10] 的 `if manifest is not None` 分支——跳过 [#14]–[#20] 的所有写文件步骤,只做 [#21]/[#22] 的元数据登记。Lance 就是这么接入 DeltaCat 的。\n\n---\n\n## 常见疑问 → 跳到\n\n| 疑问 | 跳到 |\n|---|---|\n| 「我没告诉它写哪,它咋决定文件名的?」 | [#17] + [#19] |\n| 「transaction 是 Python 上下文管理器吗?」 | [#7] + [#21] |\n| 「为什么新建表还要 stage_partition?」 | [#12] |\n| 「manifest 跟 Iceberg 那个 manifest 一回事吗?」 | [#23] |\n| 「我怎么知道取到 APPEND 而不是 ADD?」 | [#11] |\n",
+  "steps": [
+    {
+      "title": "Intro: 本次 tour 的目标和读法",
+      "description": "本 tour 跟踪 **dc.write_to_table** 的标准(胖客户端)路径——从 `import deltacat as dc` 一直到磁盘上的 `.parquet` 文件落地。\n\n## 读法建议\n\n- 上方 CodeTour Explorer 侧栏里,每一步都是一张卡片,第一行是模块名前缀(如 `Catalog 层:`)。\n- 边读边对照每一步描述里的「**关注变量**」小表,把 3~5 个关键名字放进脑子里。\n- 遇到 `if / elif` 的步骤,我会明确写出**本次调用走哪条分支**,不跑偏。\n- 每一步的 **本次取值** 模块是「如果你只看一行,就看这个」。\n\n## 前提假设\n\n用户跑的脚本(本 tour 的「这次调用」参照):\n\n```python\nimport deltacat as dc\nimport pyarrow as pa\nfrom deltacat.types.media import ContentType\nfrom deltacat.types.tables import TableWriteMode\n\ntbl = pa.table({「id」: [1, 2, 3], 「name」: [「a」, 「b」, 「c」]})\ndc.init_local(root=「/tmp/my_catalog」)\ndc.write_to_table(\n    data=tbl,\n    table=「users」,\n    namespace=「demo」,\n    content_type=ContentType.PARQUET,\n    mode=TableWriteMode.CREATE,\n)\n```\n\n表「demo.users」不存在 ⇒ 待会 [#8] 会拿到 `table_exists_flag=False`,然后 [#9] 新建表。\n\n展开 CodeTour 右下角的 `View Tour Overview` 查看全局流程图和速查表。"
+    },
+    {
+      "file": "deltacat/__init__.py",
+      "line": 38,
+      "location": "deltacat.__init__",
+      "title": "用户入口 User Entry: `dc.write_to_table` 从这里暴露",
+      "tags": [
+        "用户入口 User Entry",
+        "role:entry",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这一行做什么:** 把 `write_to_table` 从 `deltacat.catalog` 子包**重导出**到顶层 `deltacat` 包,这样用户就能写 `dc.write_to_table(...)` 而不用写长长的 `deltacat.catalog.delegate.write_to_table(...)`。\n\n**关注逻辑:** Python 中 `dc.X` 实际上做了两件事:(1) 加载 `deltacat/__init__.py`;(2) 在它的**本地命名空间**里找名字 `X`。这一行 `from deltacat.catalog import ( ..., write_to_table, ...)` 让这个名字出现在了 `deltacat` 模块的顶层。下一跳去看它的真正定义。\n\n**关注变量:**\n\n| 名字 | 来源 | 下一跳 |\n|---|---|---|\n| `write_to_table` | 这里从 `deltacat.catalog` 导入 | [#2] 看它在 catalog 包里又从哪来 |\n\n**本次取值:** 用户代码里 `dc.write_to_table(...)` 在这一刻就等价于 `deltacat.catalog.write_to_table(...)`。第 114 行还有个便捷别名 `write = write_to_table`,所以 `dc.write(...)` 也能跑——都指向同一个函数对象。"
+    },
+    {
+      "file": "deltacat/catalog/__init__.py",
+      "line": 19,
+      "location": "deltacat.catalog.__init__",
+      "title": "用户入口 User Entry: catalog 子包再转发一次",
+      "tags": [
+        "用户入口 User Entry",
+        "role:dispatch",
+        "priority:P2"
+      ],
+      "color": "#3b82f6",
+      "description": "**这一行做什么:** 把 `write_to_table` 从 `deltacat.catalog.delegate`(真正的分发层)重导出到 `deltacat.catalog` 包。\n\n**关注逻辑:** DeltaCat 有**多个 catalog 实现**(native、Iceberg、未来可能的 Glue 等)。入口函数不能硬写死调哪一个,所以中间夹了一层 `delegate.py`——它读出「当前激活的 catalog 实例」,然后把调用转给那个 catalog 的 `impl`。\n\n这一行只是路径链条的第二环;下一跳 [#3] 才是实际执行逻辑的 `delegate.py::write_to_table`。\n\n**本次取值:** 在 `dc.init_local(root=「/tmp/my_catalog」)` 之后,当前激活的 catalog 是**默认的 DeltaCat native catalog**,所以 [#3] 里 `catalog_obj.impl` 最终会解析为 [#6] 的 `deltacat.catalog.main.impl` 模块。"
+    },
+    {
+      "file": "deltacat/catalog/delegate.py",
+      "line": 99,
+      "location": "write_to_table",
+      "title": "用户入口 User Entry: `delegate.write_to_table` 按名字解析 catalog 实现",
+      "tags": [
+        "用户入口 User Entry",
+        "role:dispatch",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这个代码块做什么:** 拿到真正的 catalog 实例(通过名字或当前激活的默认值),然后把所有参数原样转发给它的 `impl.write_to_table`。这就是 **catalog 分发** 的地方。\n\n**关注逻辑:** 这里的两个关键语句:\n\n- `catalog_obj = get_catalog(catalog)` —— 没指定名字就返回默认 catalog。\n- `return catalog_obj.impl.write_to_table(..., inner=catalog_obj.inner, **kwargs)` —— `impl` 是一个模块对象(比如 `deltacat.catalog.main.impl`),`inner` 是这个 catalog 的 `CatalogProperties`(里面有 `root=「/tmp/my_catalog」` 和文件系统句柄)。\n\n这层「按名字分发」让同一段用户代码既能写 native catalog,也能写 Iceberg catalog——只要用户在 `init_local` / `put_catalog` 时声明的名字对得上。\n\n**关注变量:**\n\n| 名字 | 类型 | 角色 |\n|---|---|---|\n| `catalog` | `Optional[str]` | 用户可以传 `catalog=「my_cat」` 选某个已注册的 catalog;本次 **None** → 拿默认 |\n| `catalog_obj` | `Catalog` | 真正的 catalog 实例 |\n| `catalog_obj.impl` | module | 本次 = `deltacat.catalog.main.impl`(见 [#6]) |\n| `catalog_obj.inner` | `CatalogProperties` | 含 `root=「/tmp/my_catalog」`、`filesystem=LocalFileSystem()` |\n\n**本次取值:** `catalog=None`, `transaction=None` → 前 10 行的所有校验都通过,直接走到 99 行调用 `catalog_obj.impl.write_to_table(...)`。下一跳进入 [#6]。"
+    },
+    {
+      "title": "Catalog 层: 从 delegate 跳进 native 实现",
+      "description": "**这个过渡页做什么:** 把读者从「分发层」带到「真正干活的地方」。\n\n从这一步起,我们离开 `catalog/delegate.py`,进入 `catalog/main/impl.py`——这是 **DeltaCat native catalog** 的实现。后面接下来的所有 [#6]–[#14] 都在这一个文件里。\n\n**心智模型:** 把 `catalog/main/impl.py::write_to_table` 想象成一个「编排器」:它不亲自写文件,而是按顺序调 6~7 个子函数(每个对应一个小阶段),每个子函数决定「下一步该干嘛」。后面 6 步(一步一个阶段)就是按这个编排顺序展开的。\n\n下一步 [#6] 进入 `write_to_table` 的函数定义。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 231,
+      "location": "write_to_table",
+      "title": "Catalog 层: `write_to_table` 函数入口——编排器开工",
+      "tags": [
+        "Catalog 层",
+        "role:entry",
+        "priority:P0"
+      ],
+      "color": "#ef4444",
+      "description": "**这个函数做什么:** 写一份数据到表的**全流程编排器**。签名:`write_to_table(data, table, *, namespace, table_version, mode, content_type, manifest, transaction, **kwargs) -> List[Delta]`。返回**本次写入产生的 Delta 列表**(通常每个 partition 一个)。\n\n**关注逻辑:** 函数体接下来做 7 件事(一件一步):\n\n1. 包进 transaction —— [#7]\n2. 表 / 表版本存在性校验 —— [#8]\n3. 表不存在则建表 —— [#9]\n4. **决策点**: 有没有预造好的 manifest? —— [#10] ← Chapter 3 的分岔口\n5. 解析写入模式 → stream + delta_type —— [#11]\n6. 准备 partition —— [#12]\n7. 真·写数据 + 登记 delta —— [#14]\n\n**关注变量(整个函数都要跟踪的 5 个名字):**\n\n| 名字 | 首次出现 | 角色 |\n|---|---|---|\n| `data` | 入参 | 用户的 `pa.Table`,本次 3 行 × 2 列 |\n| `mode` | 入参 | 本次 = `TableWriteMode.CREATE` |\n| `content_type` | 入参 | 本次 = `ContentType.PARQUET` |\n| `manifest` | 入参 | 本次 = **None** → 走胖客户端路径 |\n| `write_transaction` | [#7] 创建 | 贯穿所有子操作的事务句柄 |\n\n**本次取值:** 顶层调用参数全部透传进来,没有任何默认值兜底触发。下一步进入 transaction 设置 [#7]。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 271,
+      "location": "write_to_table",
+      "title": "Catalog 层: 起一个 transaction 包裹整次写入",
+      "tags": [
+        "Catalog 层",
+        "role:main",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这一行做什么:** 调 `setup_transaction(transaction=None, **kwargs)`——当前**没有正在进行的事务**,所以它**新开一个**,并把 `commit_transaction=True` 标记返回,意思是「写完由我自己来 seal」。\n\n**关注逻辑:** DeltaCat 的每次元数据改动(建表、staged partition、delta commit)都是往 transaction 里**追加一条操作记录**。所有操作都积攒好后,最后一次性 `transaction.seal()` ([#21] 附近) 提交。这就是原子性的来源——崩在中途的话,没 seal 的 transaction 里的任何 operation 都不会被观察到。\n\n下一行 `kwargs[「transaction」] = write_transaction` 把这个 transaction 塞进 kwargs,让所有下游函数都能拿到它,避免每一层都显式传参。\n\n**关注变量:**\n\n| 名字 | 本次取值 | 角色 |\n|---|---|---|\n| `transaction`(入参) | `None` | 用户没传 |\n| `write_transaction` | 新建的 `Transaction` 对象 | 所有子操作共享 |\n| `commit_transaction` | `True` | 走到 `finally` 时会 `write_transaction.seal()`(见函数末尾 492 行) |\n\n**本次取值:** 因为入参 `transaction=None`,`setup_transaction` 进入 `commit_transaction=True` 分支,开了个全新的 transaction。下一跳 [#8] 校验表是否存在。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 276,
+      "location": "_get_table_and_validate_write_mode",
+      "title": "Catalog 层: 问一句「表存在吗?」并校验 write_mode 合法",
+      "tags": [
+        "Catalog 层",
+        "role:main",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这一段做什么:** 调 `_get_table_and_validate_write_mode`(定义在 124 行),拿到两个返回值:`table_exists_flag` 和 `existing_table_def`。这是**所有后续分支的输入信号**。\n\n**关注逻辑:** 函数体(124–180 行)只做两件事:\n\n1. 读 metastore 查「demo.users」表 → 本次**不存在**,所以 `existing_table_def = None`,`table_exists_flag = False`(144–147 行)。\n2. 校验 `mode` 和现状是否矛盾(151–179 行):\n   - `mode=CREATE` + 表已存在 → 报 `TableAlreadyExistsError`\n   - `mode` ∈ (APPEND/REPLACE/MERGE/…) + 表不存在 → 报 `TableNotFoundError`\n   - 本次 `mode=CREATE` + 表**不存在** → **全部通过**。\n\n**关注变量:**\n\n| 名字 | 本次取值 | 角色 |\n|---|---|---|\n| `table_exists_flag` | `False` | 下游 [#9]/[#11]/[#12] 都用它分支 |\n| `table_definition` | `None` | 本次是新表,没有现成定义 |\n\n**本次取值:** 返回 `(False, None)`。下一跳 [#9] 走「建表」分支。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 285,
+      "location": "write_to_table",
+      "title": "Catalog 层: 分支决策——表不存在,要不要建?",
+      "tags": [
+        "Catalog 层",
+        "role:branch-taken",
+        "priority:P0"
+      ],
+      "color": "#ef4444",
+      "description": "**这个决策做什么:** `if not table_exists_flag:` 判断是否要**创建新表**。\n\n**关注逻辑:**\n\n- 本次 `table_exists_flag = False` → **条件为 True,进入建表分支**。\n- 286 行又套一个小 `if manifest is not None`——如果用户预先提供了 manifest,把它塞进 kwargs,给 `_create_table_for_write` 用(schema 从 manifest 推)。**本次 `manifest=None`,跳过**。\n- 288 行真正建表:`_create_table_for_write` 定义在 196 行,会从 `data` 推 schema、验证 content_type、调 `create_table` 往 transaction 里追加一条 CREATE 操作。\n\nelse 分支(298–316 行)是「表已存在,看看有没有 alter_table kwargs,有就顺带 alter 一下」。\n\n**本次取值:** 走 **if** 分支,调用 `_create_table_for_write(data=tbl, table=「users」, namespace=「demo」, ...)`。\n- schema 从 `pa.Table` 自动推出来 → `id: int64, name: string`\n- 建表操作被 **追加到 write_transaction**,还没落盘;将在函数末尾 `seal()` 时统一提交\n\n下一跳 [#10]——本 tour 的关键伏笔:manifest-only 分支。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 382,
+      "location": "write_to_table",
+      "title": "Catalog 层: 🚪 分岔口——Chapter 3 (Lance) 走这里,本 tour 跳过",
+      "tags": [
+        "Catalog 层",
+        "role:branch-skipped",
+        "priority:P0"
+      ],
+      "color": "#ef4444",
+      "description": "**这个分支做什么:** 如果用户**已经自己写好了数据文件**,并构造了一个 `Manifest` 对象,直接用那个 manifest 登记 delta,**跳过所有数据写入逻辑**。\n\n这就是 **thin-client / 瘦客户端** 路径,也是 Lance 集成走的路径(DeltaCat 只当元数据登记员,不碰数据字节)。\n\n**关注逻辑(虽然本次不走):** 这个分支只做 3 件事:\n\n1. `stage_delta_from_manifest(manifest, partition, ...)` —— 用现成 manifest 造一个 staged Delta 对象,**不写任何文件**。\n2. `storage_commit_delta(delta=delta, ...)` —— 把 delta 元数据登记进 transaction。\n3. 若需要,`storage_commit_partition(...)` —— 同样登记 partition。\n4. `return [delta]` —— **直接返回,根本不走 [#13]–[#20] 的数据写入链**。\n\n**本次取值:** `manifest` 变量是 **None**(用户没传),所以**条件为 False,整个 382–400 这段代码块全部跳过**,继续往下执行 402 行开始的胖客户端数据处理。\n\n> **跟 Chapter 3 的联系:** 未来那条 tour 会从**用户已经有一组 .lance 文件的场景**切入,构造 `Manifest` 对象,然后精确命中这个分支——走 389 行的 `stage_delta_from_manifest` 而不是本 tour 要走的 [#15] `stage_delta`。对比两条路径就能理解为什么 Lance 需要一条「不写字节」的捷径:Lance 的数据格式和 DeltaCat 默认的 Parquet writer 不兼容,让 DeltaCat 来写反而多此一举。\n\n下一跳 [#11] 回到主路径,解析写入模式。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 342,
+      "location": "_handle_write_mode",
+      "title": "Catalog 层: 解析写入模式,得到 stream + delta_type",
+      "tags": [
+        "Catalog 层",
+        "role:main",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这一段做什么:** 回到 342 行(顺序上先于 [#10] 的 manifest 分支),调 `_handle_write_mode(mode=CREATE, ..., table_exists_flag=False)`,它按 `mode` 分派到具体处理器,返回 `(stream, delta_type)`。\n\n**关注逻辑:** `_handle_write_mode` 定义在 497 行,是个**分派表**:\n\n| 本次 mode | 分派到 | 行为 |\n|---|---|---|\n| REPLACE | `_handle_replace_mode` (554) | stage 新 stream,再 commit |\n| APPEND | `_handle_append_mode` (578) | 沿用现有 stream,delta_type=APPEND |\n| ADD | `_handle_add_mode` (602) | 沿用,delta_type=ADD |\n| MERGE/DELETE | `_handle_merge_delete_mode` (626) | 校验 merge_keys,设 UPSERT/DELETE |\n| **AUTO / CREATE** | **`_handle_auto_create_mode` (652)** | **沿用现有 stream,按规则选 delta_type** |\n\n**`_handle_auto_create_mode` (652 行) 的 delta_type 选择(667–674 行):**\n- 有 merge_keys? → UPSERT。**本次 schema 无 merge_keys → 跳过**。\n- 表已存在? → ADD(无序追加)。**本次 `table_exists_flag=False` → 跳过**。\n- 否则 → **APPEND(有序追加)**。**← 本次走这个**。\n\n**本次取值:** `stream` = 刚才 [#9] 建表时自动创建的默认 stream(通过 `_get_table_stream` 取回),`delta_type = DeltaType.APPEND`。下一跳 [#12] 准备 partition。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 714,
+      "location": "_handle_partition_creation",
+      "title": "Partition 创建: `_handle_partition_creation` 的三路分派",
+      "tags": [
+        "Partition 创建",
+        "role:main",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这个函数做什么:** 决定「这次写入要用哪个 partition」——是 stage 一个新的、还是沿用旧的?返回 `(partition, commit_staged_partition)`,后者告诉主流程「最后要不要主动 commit 它」。\n\n**关注逻辑:** 函数体是个三路分派(722–757 行):\n\n| 条件 | 分支 | 本次? |\n|---|---|---|\n| `mode==REPLACE` **或** `not table_exists_flag` | 722 → stage 新 partition;若 UPSERT/DELETE 留给 compaction 提交,否则 commit_staged=True | **✓ 本次走这里**(`table_exists_flag=False`) |\n| `delta_type ∈ (UPSERT, DELETE)` | 728 → 尝试拿现有 partition,拿不到再 stage 一个;commit_staged=False | 跳过 |\n| 其他(APPEND/ADD on existing) | 743 → 拿现有 partition,拿不到才 stage 新的 | 跳过 |\n\n本次新表 + `delta_type=APPEND`(不在 UPSERT/DELETE 里),724 行 `stage_partition` 被调,726 行计算 `commit_staged_partition = APPEND not in (UPSERT, DELETE) = True`。\n\n**关注变量:**\n\n| 名字 | 本次取值 | 角色 |\n|---|---|---|\n| `partition` | 新 stage 的 `Partition` 对象,`partition_id=<随机 uuid>` | 写文件时拿它的 id 当子目录名 [#17] |\n| `commit_staged_partition` | `True` | [#22] 里会被用到——明确要调 `commit_partition` |\n\n**本次取值:** 走 722 的 if 分支,返回 `(new_staged_partition, True)`。下一跳 [#13] 追 `stage_partition` 的内部。"
+    },
+    {
+      "file": "deltacat/storage/main/impl.py",
+      "line": 2194,
+      "location": "stage_partition",
+      "title": "Partition 创建: `stage_partition` 在 transaction 里登记一条 CREATE",
+      "tags": [
+        "Partition 创建",
+        "role:utility-dive",
+        "priority:P2"
+      ],
+      "color": "#3b82f6",
+      "description": "**这个函数做什么:** 为给定的 stream **在元数据层新建一个 partition 对象**,挂在 transaction 上等待最后 seal 时落盘。**不碰任何数据文件**——partition 在这里只是个元数据概念。\n\n**关注逻辑:** 主干简化版:\n\n```python\n# 1. 取回 table_version,校验 partition_scheme_id 合法 (2216–2269)\n# 2. 造 locator = PartitionLocator(stream_locator, partition_values=None, partition_id=uuid4())\n# 3. 造 partition = Partition(state=STAGED, content_types=..., stream_position=None)\n# 4. 找一下有没有「previous partition」(同 values + scheme),有就串起来做 CoW\n# 5. transaction.step(CREATE, dest_metafile=partition)  ← 关键一步\n# 6. 返回 partition\n```\n\n关键点:第 2304 行的 `transaction.step(TransactionOperation.of(operation_type=CREATE, dest_metafile=partition))`——这是 **transaction 模型** 的用法:每个元数据改动都是一条「operation」,不立即落盘,等 `transaction.seal()` 时一起写。\n\n**本次取值:**\n- 用户未传 `partition_values`(本表无分区) → 2231 行 `partition_scheme_id = UNPARTITIONED_SCHEME_ID`\n- `prev_partition = None`(新表) → `previous_partition_id = None`\n- `partition.state = CommitState.STAGED`\n- `commit_transaction = False`(我们传进来的是已激活的 `write_transaction`,由 [#7] 创建、[#21] 附近 seal)\n\n回到 [#12] 的调用点,主流程继续往下走,进入 [#14] 的数据写入阶段。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 472,
+      "location": "write_to_table",
+      "title": "写数据 + Staging Delta: 主流程调 `_stage_commit_and_compact`",
+      "tags": [
+        "写数据 + Staging Delta",
+        "role:call-site",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这一段做什么:** 前面 411–466 行已经把 `data` 校验/coerce 过一遍(schema evolution、reader 兼容性),在 472 行开始调 `_stage_commit_and_compact(...)`——这是**把字节真的写出去**的起点。\n\n**关注逻辑:** 在进入 `_stage_commit_and_compact` 之前,前面这一大段主要做**数据层的预处理**:\n\n- 418 行 `_convert_data_if_needed(data)`:如果是 Daft DataFrame 转成 pa.Table。**本次 data 已经是 pa.Table → 原样返回**。\n- 425–434 行 `_validate_and_coerce_data_against_schema`:按 schema 校验并可能改 schema(evolution)。**本次表刚建,schema 完全匹配 → 无 evolution,`schema_modified=False`**。\n- 443 行 `_validate_reader_compatibility`:确认未来所有要读这张表的 reader 都能读 Parquet + int64/string。**本次表无 `SUPPORTED_READER_TYPES` 约束,直接通过**。\n\n**本次取值:** 472 行调用 `_stage_commit_and_compact(converted_data=tbl, partition=<staged>, delta_type=APPEND, content_type=PARQUET, commit_staged_partition=True, ...)`。下一跳 [#15] 进函数内部。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 967,
+      "location": "_stage_commit_and_compact",
+      "title": "写数据 + Staging Delta: `_stage_commit_and_compact` 调 `storage.stage_delta`",
+      "tags": [
+        "写数据 + Staging Delta",
+        "role:call-site",
+        "priority:P0"
+      ],
+      "color": "#ef4444",
+      "description": "**这一段做什么:** 函数定义从 942 行起,但真正发生的事在 967 行起:委托给 **storage 层的 `stage_delta`**——这是**字节落盘**的入口。\n\n**关注逻辑:** 函数体按顺序做 3 件事:\n\n1. **967–977 行 `storage.stage_delta(data=..., partition=..., delta_type=APPEND, content_type=PARQUET, author=「deltacat.write_to_table/<版本>」, schema=...)`** —— 写数据文件 + 建 manifest,返回**未登记**的 Delta 对象。\n2. **979 行 `storage.commit_delta(delta=delta, ...)`** —— 把 delta 的元数据登记进 transaction([#21] 详解)。\n3. **981–982 行** 如果 `commit_staged_partition=True`,也登记 partition。\n\n后面(984+)还有 compaction 触发逻辑,但对「新建表+单次 APPEND」来说 `_trigger_compaction` 会返回 False,不会跑 V2 compaction。\n\n**关注变量:**\n\n| 名字 | 本次取值 | 角色 |\n|---|---|---|\n| `converted_data` | 原 `pa.Table`(3 行) | 传给 storage 层写文件 |\n| `delta` | 977 行返回的 Delta | 持有 manifest 的元数据对象 |\n| `author` | `ManifestAuthor(name=「deltacat.write_to_table」, version=dc.__version__)` | 写进 manifest 里当审计 |\n\n**本次取值:** 跳进 `deltacat/storage/main/impl.py::stage_delta` ([#16])。"
+    },
+    {
+      "file": "deltacat/storage/main/impl.py",
+      "line": 2717,
+      "location": "stage_delta",
+      "title": "写数据 + Staging Delta: `stage_delta` 转身调 `_write_table`",
+      "tags": [
+        "写数据 + Staging Delta",
+        "role:main",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这个函数做什么(定义在 2661):** 把 dataset 写到 1+ 个数据文件,返回**未登记**的 Delta(含 manifest,manifest 的 entries 指向刚写的文件)。\n\n**关注逻辑:** 函数主干 3 段:\n\n- **2685–2696 行:** 校验 partition 支持该 content_type 且非 DEPRECATED;算 `previous_stream_position`(非 ADD delta 沿用 partition 的 stream_position)。\n- **2699–2715 行:** 整理 `table_writer_kwargs`——把 `schema.arrow`(PyArrow schema)、`schema_id`、`sort_scheme_id` 塞进去,一会传给 writer。\n- **2717–2728 行 ← 当前步聚焦:** 调 `_write_table(partition_id=partition.partition_id, data=tbl, max_records_per_entry=None, author=..., content_type=PARQUET, ..., table_writer_kwargs=...)` **→ 这是实际写文件 + 建 manifest 的入口**。\n- **2729–2737 行:** 把返回的 manifest 包进 `Delta.of(...)`,返回 staged delta(还没登记,只是对象)。\n\n**关注变量:**\n\n| 名字 | 本次取值 | 作用 |\n|---|---|---|\n| `partition.partition_id` | [#13] 生成的 uuid4 | 会变成数据目录名 [#17] |\n| `max_records_per_entry` | `None` | 整张 tbl 写一个文件(不切片,见 [#18]) |\n| `content_type` | `ContentType.PARQUET` | 决定 writer 选 `write_parquet` [#20] |\n| `table_writer_kwargs[「schema」]` | `tbl.schema`(pyarrow.Schema) | 指导 Parquet writer |\n\n**本次取值:** 跳进 `_write_table` ([#17])。"
+    },
+    {
+      "file": "deltacat/storage/main/impl.py",
+      "line": 2594,
+      "location": "_write_table_slices",
+      "title": "写数据 + Staging Delta: 🎯 DeltaCat 在这里决定输出路径",
+      "tags": [
+        "写数据 + Staging Delta",
+        "role:main",
+        "priority:P0"
+      ],
+      "color": "#ef4444",
+      "description": "**这几行做什么:** `_write_table`(2620 行)调用 `_write_table_slices`(2577 行),它的 **2594–2599 行** 就是本 tour 最关键的「DeltaCat 自主决定写哪」**:\n\n```python\ndata_dir_path = posixpath.join(\n    catalog_properties.root,   # /tmp/my_catalog\n    DATA_FILE_DIR_NAME,        # 常量「data」(deltacat/constants.py:108)\n    partition_id,              # [#13] 生成的 uuid4,例如 「a3f…e91」\n)\nfilesystem.create_dir(data_dir_path, recursive=True)\n```\n\n**这就是「胖客户端」的定义 time**——用户**从未告诉 DeltaCat 写哪**,路径完全由 DeltaCat 按 `<root>/data/<partition_id>/` 的约定拼出来。Chapter 3 的 Lance 路径 **没有这一步**,因为文件是用户自己写的,路径是用户自己选的。\n\n**关注逻辑:**\n\n- `catalog_properties = get_catalog_properties(**kwargs)` (2589) —— 从 `kwargs[「inner」]` 解出 `CatalogProperties(root=「/tmp/my_catalog」, filesystem=LocalFileSystem)`。\n- `filesystem.create_dir(data_dir_path, recursive=True)` —— 用 `LocalFileSystem` 在本地 mkdir -p。\n- 2601–2602 行 `table_writer_kwargs[「catalog_properties」] = catalog_properties` —— 传下去让 manifest entry 能算相对路径 ([#23])。\n\n**本次取值:**\n- `catalog_properties.root = 「/tmp/my_catalog」`(来自 `dc.init_local(root=...)`)\n- `DATA_FILE_DIR_NAME = 「data」`\n- `partition_id = 「<随机 uuid4>」`(本次 e.g. `「a3f2...」`)\n- → `data_dir_path = 「/tmp/my_catalog/data/a3f2.../」`,mkdir -p 之后交给 [#18] `write_sliced_table` 写进去。\n\n下一跳 [#18]。"
+    },
+    {
+      "file": "deltacat/types/tables.py",
+      "line": 1126,
+      "location": "write_sliced_table",
+      "title": "写数据 + Staging Delta: `write_sliced_table` 决定「整张写还是切片写」",
+      "tags": [
+        "写数据 + Staging Delta",
+        "role:main",
+        "priority:P2"
+      ],
+      "color": "#3b82f6",
+      "description": "**这个函数做什么(定义在 1080 行):** 如果用户指定了 `max_records_per_entry`,按记录数切片,每片写一个文件;否则整张表写一个文件。每次写都包在 `tenacity.Retrying` 里,遇到 `RetryableError` 自动重试。\n\n**关注逻辑:** 核心分支在 1122–1139 行:\n\n```python\nshould_write_whole_table = max_records_per_entry is None or not get_table_length(table)\n\nif should_write_whole_table:\n    return retrying(write_table, table, base_path, ..., content_type, ...)\nelse:\n    # 1140: slices = table_slicer_fn(table, max_records_per_entry)\n    # 1145: for slice in slices: retrying(write_table, slice, ...)\n```\n\n本次 `max_records_per_entry = None`([#16] 的 stage_delta 默认值) → `should_write_whole_table = True` → 整张表写一个文件。\n\n**本次取值:** 走 1126 行的 if 分支,直接调 [#19] 的 `write_table`。跳过 1140 行的切片逻辑。"
+    },
+    {
+      "file": "deltacat/types/tables.py",
+      "line": 1211,
+      "location": "write_table",
+      "title": "写数据 + Staging Delta: `write_table` 造 uuid 文件名、调 writer",
+      "tags": [
+        "写数据 + Staging Delta",
+        "role:main",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这一段做什么:** `write_table`(1167 行起)准备一个 `UuidBlockWritePathProvider`——**它是文件名生成器**(`<uuid4>.parquet`)——然后调具体的 `table_writer_fn` 真正写,最后根据写回的路径列表生成 `ManifestEntry` 列表。\n\n**关注逻辑:** 简化的控制流:\n\n```python\n# 1211  capture_object = CapturedBlockWritePaths(...)   ← 收集「实际写进去的路径」\n# 1219  block_write_path_provider = UuidBlockWritePathProvider(\n#           capture_object,\n#           base_path=「/tmp/my_catalog/data/<uuid>/」,\n#           content_type=PARQUET,   ← 决定文件后缀「.parquet」\n#           content_encoding=None,  ← Parquet 自带压缩,不需要 .gzip\n#       )\n# 1233  table_writer_fn(                  ← 对 pa.Table 就是 pa_utils.table_to_file\n#           table, base_path, filesystem,\n#           block_write_path_provider,    ← writer 调 provider 拿文件名\n#           content_type.value=「parquet」,\n#           schema=<pyarrow schema>,\n#           **table_writer_kwargs,\n#       )\n# 1246  write_paths = capture_object.write_paths()   ← 拿到实际写的文件名\n# 1256+ 用 ManifestEntry.from_path 为每个文件建 entry\n```\n\nfilename 怎么产生:`UuidBlockWritePathProvider._get_write_path_for_block` (types/tables.py:1399 行) 生成 `uuid4() + 「.parquet」`,拼成 `<base_path>/<uuid>.parquet`——和 `partition_id` 一样,**完全由 DeltaCat 自己决定**,不由用户指定。\n\n**本次取值:**\n- `skip_manifest_write = False`(胖客户端默认);Chapter 3 的 manifest-only 路径会显式传 True。\n- `content_type = PARQUET`,走 1219 行带 content_type 的 path provider。\n- `content_encoding = None`(PARQUET 不在 `EXPLICIT_COMPRESSION_CONTENT_TYPES` 里)。\n\n下一跳 [#20] 追到最底层的 Parquet 写入。"
+    },
+    {
+      "file": "deltacat/utils/pyarrow.py",
+      "line": 610,
+      "location": "write_parquet",
+      "title": "写数据 + Staging Delta: 字节落盘 ⚡ `papq.write_table(table, f)`",
+      "tags": [
+        "写数据 + Staging Delta",
+        "role:main",
+        "priority:P0"
+      ],
+      "color": "#ef4444",
+      "description": "**这一行做什么:** 用 PyArrow 的 `parquet.write_table(table, file_handle)` 把 3 行 `pa.Table` 序列化为 Parquet 字节流,写入 `/tmp/my_catalog/data/<partition_id>/<uuid>.parquet`。**这是整个胖客户端路径里 DeltaCat 真正「写字节」的地方**。\n\n**关注逻辑(整条 writer 链的终点):**\n\n1. [#19] `write_table` 调 `table_writer_fn`,这个函数通过 types/tables.py:119 行的分派表 `TABLE_CLASS_TO_WRITER_FUNC[pa.Table] = pa_utils.table_to_file` 确定。\n2. `table_to_file`(pyarrow.py:1003 行起):\n   - 1024 行 `writer = CONTENT_TYPE_TO_PA_WRITE_FUNC.get(「parquet」) = write_parquet`(见 670–680 行的分派表)。\n   - 1031 行 `filename = block_path_provider(base_path)` → 触发 [#19] 里 provider 生成 uuid 文件名,且**把路径缓存进 `capture_object`**(关键:write_table 最后靠这个读回写了哪些文件)。\n   - 1036 行 `writer(table, path, filesystem=filesystem, **writer_kwargs)` → 本 step 聚焦的 `write_parquet`。\n3. `write_parquet`(pyarrow.py:599 行):\n   - 本次 `filesystem` 是 `pyarrow.fs.LocalFileSystem`(是 `pafs.FileSystem` 的子类) → 走 607–610 行分支。\n   - **610 行 `papq.write_table(table, f, **write_kwargs)`** —— 这就是终点,`papq` = `pyarrow.parquet`。\n\n**本次取值:**\n- `table` = 用户的 `pa.Table`,3 行 `{id: [1,2,3], name: [「a」,「b」,「c」]}`。\n- `path` = `「/tmp/my_catalog/data/<partition_id>/<uuid>.parquet」`,具体 uuid 是 [#19] 那次 `block_write_path_provider(base_path)` 调用现场生成的。\n- `f` = `filesystem.open_output_stream(path)` 返回的二进制输出流。\n- `write_kwargs` = 空(无压缩等额外参数)。\n\n至此**数据文件已经落地**。返回调用栈,走到 [#21] 开始做元数据登记。"
+    },
+    {
+      "file": "deltacat/storage/main/impl.py",
+      "line": 2846,
+      "location": "commit_delta",
+      "title": "Storage 提交: `commit_delta` 往 transaction 追加 CREATE 操作",
+      "tags": [
+        "Storage 提交",
+        "role:main",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这一段做什么:** 把 [#16] 返回的 staged Delta **登记**进 transaction——分配 `stream_position`,往 transaction 里追加一条 `CREATE` 操作(对应 delta 本身),以及一条 `UPDATE` 操作(更新 parent partition 的 stream_position)。\n\n**关注逻辑(函数从 2774 行开始):**\n\n- **2790–2793 行:** `Metafile.update_for(delta)` 克隆 delta 做修改,确保不改动原对象。\n- **2797–2814 行:** 解析 delta 的 parent partition(按 id 或 values 查),失败就报 `PartitionNotFoundError`。\n- **2819–2835 行:** 算 `stream_position`:\n  - 非 ADD delta(本次 APPEND)→ 沿用 `parent_partition.stream_position`(新表为 0) + 1 = **1**。\n  - ADD delta → 用 uuid4 生成一个大于 UINT32_MAX 的随机 64-bit 值(无序)。\n  - 本次 **走非 ADD 分支,`delta.locator.stream_position = 1`**,并造 `new_parent_partition`(复本)把 `stream_position` 设为 1。\n- **2846 行(聚焦):** `transaction.step(TransactionOperation.of(CREATE, dest_metafile=delta))` —— **第 1 条操作**:创建 delta 元数据文件。\n- **2857–2863 行:** 若 `new_parent_partition` 存在(本次 APPEND 有),追加 **第 2 条操作** `UPDATE partition`——更新 partition 的 stream_position。\n- **2865–2866 行:** 我们传进来的是主流程的 `write_transaction`,所以 `commit_transaction=False`,**不在这里 seal**,留给 [#7] 的 finally。\n\n**本次取值:** 两条操作追加进同一个 transaction,内存里等着。下一跳 [#22] 还要登记 partition。"
+    },
+    {
+      "file": "deltacat/catalog/main/impl.py",
+      "line": 982,
+      "location": "_stage_commit_and_compact",
+      "title": "Storage 提交: 也登记 partition,然后 finally 一把 seal",
+      "tags": [
+        "Storage 提交",
+        "role:main",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这一行做什么:** 因为 [#12] 给了 `commit_staged_partition=True`,调用 `storage.commit_partition(partition=<staged>)`,把 partition 从 STAGED 扶正为 COMMITTED 的操作也追加进同一个 transaction。\n\n**关注逻辑:** `commit_partition` (storage/main/impl.py:2320 行)的职责对称于 `commit_delta`:\n\n- 重新拿回 staged partition,校验非空。\n- 计算应替换的历史 partition(CoW 链)。\n- 往 transaction 追加 CREATE/UPDATE 操作。\n- 同样由主流程的 transaction 统一 seal,不在这里 commit。\n\n然后回到 [#7] 的主流程 `write_to_table` 函数末尾 492 行 `finally` 块:\n\n```python\nfinally:\n    if commit_transaction:     # ← [#7] 算出来是 True\n        write_transaction.seal()   # ← 最终原子提交\n```\n\n**这是整个标准写路径的 commit point**——一次 `seal()` 里同时落盘:建表 ([#9])、staged partition ([#13])、commit delta ([#21])、commit partition (本步)。任何一步失败,transaction 都不会 seal,磁盘上只剩孤立的数据文件(后续 txn 清理会处理)——**元数据一致性不被破坏**。\n\n**本次取值:** 总共 4–5 条 operations 集体 seal,成为一个原子事务。至此 DeltaCat 侧工作完成,函数返回 `[delta]`(包装后返回给用户)。\n\n下一跳 [#23] 解释 manifest 的角色。"
+    },
+    {
+      "file": "deltacat/storage/model/manifest.py",
+      "line": 472,
+      "location": "ManifestEntry.from_path",
+      "title": "产出 Manifest: `ManifestEntry.from_path` 把「物理文件」登记成「逻辑条目」",
+      "tags": [
+        "产出 Manifest",
+        "role:utility-dive",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这个函数做什么(定义从 472 行起):** 对于 [#20] 写出去的每一个 Parquet 文件,调 `ManifestEntry.from_path(path, filesystem, record_count, source_content_length, content_type=「parquet」, ...)` 造一个 `ManifestEntry` 对象。**这是「逻辑 delta ↔ 物理文件」的粘合剂**。\n\n**关注逻辑:** 被调用的时机:types/tables.py:1259 行的循环:\n\n```python\nfor block_idx, path in enumerate(write_paths):\n    manifest_entry = ManifestEntry.from_path(\n        path=path,                                    # 「/tmp/my_catalog/data/<partition_id>/<uuid>.parquet」\n        filesystem=filesystem,                        # LocalFileSystem\n        record_count=metadata[block_idx].num_rows,    # 本次 = 3\n        source_content_length=metadata[block_idx].size_bytes,\n        content_type=「parquet」,\n        content_encoding=None,\n        schema_id=schema_id,\n        sort_scheme_id=sort_scheme_id,\n        catalog_root=catalog_properties.root,         # 「/tmp/my_catalog」——用来算相对 URL\n    )\n```\n\n函数体的关键工作(472 行之后):\n\n1. 读取文件大小(`filesystem.get_file_info(path).size`)。\n2. 基于 `catalog_root` 把绝对 path 变成**相对于 catalog root** 的 URL(可移植性:把目录拷到别处,manifest 仍有效)。\n3. 构造 `ManifestMeta`(record_count、content_length、content_type、schema_id、…)。\n4. 返回 `ManifestEntry.of(url=<相对 url>, meta=meta, uuid=…)`——见 408 行 `of(...)` 静态工厂。\n\n**关注变量(ManifestEntry 的字段):**\n\n| 字段 | 本次取值 | 用途 |\n|---|---|---|\n| `url` | 「data/<partition_id>/<uuid>.parquet」(相对) | 读表时按此定位字节 |\n| `meta.record_count` | `3` | 聚合统计、谓词下推 |\n| `meta.content_length` | 文件大小(字节) | 成本估算 |\n| `meta.content_type` | `「parquet」` | 选对的 reader |\n| `meta.schema_id` | 建表时的 schema id | 支持 schema evolution |\n\n下一跳 [#24] 看这些 entry 如何聚合成 Manifest。"
+    },
+    {
+      "file": "deltacat/storage/model/manifest.py",
+      "line": 122,
+      "location": "Manifest.of",
+      "title": "产出 Manifest: `Manifest.of` 把 entry 列表封装成 Manifest",
+      "tags": [
+        "产出 Manifest",
+        "role:return",
+        "priority:P1"
+      ],
+      "color": "#f59e0b",
+      "description": "**这个函数做什么(定义在 122 行):** 把 [#23] 造出来的 `ManifestEntry` 列表封装成一个 `Manifest` 对象——加上 uuid、author、聚合的 meta(汇总各 entry 的 record_count、content_length)。它的返回值就是 [#16] 的 stage_delta 里塞进 `Delta` 的 `manifest` 字段。\n\n**关注逻辑(一眼看懂的结构):**\n\n```\nManifest (dict)\n├── id          = uuid4()                      ← 这次调用独有的\n├── author      = ManifestAuthor(              ← 谁写的,干审计用\n│       name=「deltacat.write_to_table」,\n│       version=dc.__version__,\n│   )\n├── meta        = ManifestMeta(                ← 聚合全部 entry\n│       record_count     = sum over entries,    本次 = 3\n│       content_length   = sum over entries,    本次 ≈ 文件字节数\n│       content_type     = 「parquet」,\n│       content_encoding = None,\n│       ...\n│   )\n└── entries     = ManifestEntryList([           ← [#23] 造的每条\n        ManifestEntry(url=「data/.../*.parquet」, meta=..., id=...),\n        ...\n    ])\n```\n\n调用链:[#17] `_write_table_slices` 返回 `manifest_entries` → [#16] 的 `_write_table` 2651 行 `Manifest.of(entries=manifest_entries, author=..., uuid=...)` → 传给 `Delta.of(...)` → stage_delta 返回 → [#21] commit_delta 登记。\n\n**本次取值:** \n- `entries` 列表长度 = 1(未切片,整张表一个文件)\n- `meta.record_count = 3`,`meta.content_type = 「parquet」`\n- 最终这个 `Manifest` 被挂在 `Delta` 上,落进 transaction,再一起 `seal()`。\n\n下一跳 [#25] 总结收束。"
+    },
+    {
+      "title": "收束:从 import 到 .parquet 字节的全链条",
+      "description": "**这一步做什么:** 以上就是 `dc.write_to_table(tbl, …, content_type=PARQUET, mode=CREATE)` 在 DeltaCat **标准(胖客户端)路径** 的完整走法。\n\n## 你该带走的 3 个心智模型\n\n1. **编排器 + 分派器。** 顶层 [#6] `write_to_table` 本身不干脏活,只是按顺序调 7 个子函数。每个子函数又按 `mode` / `delta_type` / `content_type` 分派到具体实现——比如 `PARQUET` 一路分派到 [#20] `write_parquet`,而 `content_type` 换成 CSV/JSON 就会走完全不同的 writer(见 pyarrow.py:670 的 `CONTENT_TYPE_TO_PA_WRITE_FUNC` 表)。\n\n2. **数据先落地,元数据后 seal。** 文件字节在 [#20] **立即写入磁盘**(不在 transaction 里),而 `Delta` / `Partition` 的**元数据变更全部堆在 transaction 里**([#7] 开、[#22] 末尾 seal)。如果 seal 前崩溃,磁盘上留的只是一个「野数据文件」——元数据一致性完好。后续 txn 清理(`FAILED_TXN_DIR_NAME`)负责扫野文件。\n\n3. **Manifest 是桥梁。** [#23] `ManifestEntry` 把「你在磁盘哪个文件」的信息编码下来,[#24] `Manifest` 把它们聚合,最后挂在 `Delta` 上。下次读表时,DeltaCat 拿到 Delta 列表 → 读每个 Delta 的 manifest → 按 entry 的 url 去 catalog_root 底下找文件。**删掉 manifest,字节还在但表已经「忘了它们」**。\n\n## 与 Chapter 3 (Lance manifest-only) 的对比\n\n| 环节 | 本 tour(标准路径) | Chapter 3(Lance 瘦客户端) |\n|---|---|---|\n| 谁决定输出路径 | DeltaCat ([#17]) | 调用方自己 |\n| 谁写字节 | DeltaCat ([#20]) | 调用方自己(用 Lance 自己的 writer) |\n| 是否调 stage_delta | ✓ [#16] | ✗,改调 `stage_delta_from_manifest`(storage/main/impl.py:2740) |\n| 是否过 [#10] 的 if 分支 | ✗(manifest=None) | ✓,走那条捷径 |\n| commit_delta / commit_partition | 同样调 [#21]/[#22] | 同样调([#10] 分支内部复用这两个) |\n\n一句话总结:**Lance 路径省掉了 [#14]–[#20] 整整 7 步**,但**保留 [#21]/[#22] 的元数据登记**——所以 Lance 写出来的表和 DeltaCat 原生写出来的表,在 metastore 角度**长得一样**,能被相同的 `dc.read_table` 逻辑读回。这就是为什么集成 Lance 需要新增的「捷径」入口 [#10] 而不是另建一套 catalog。\n\n## 下一步去哪\n\n- 想精确看瘦客户端路径,点 [#10] 的绿色部分,然后打开 Chapter 3 tour(`03-deltacat-lance-manifest-only.tour`,如果存在)。\n- 想看**读路径**(`dc.read_table`),未来的 Chapter 4 会对称跟踪,这条读路径需要理解的核心对象正是 [#24] 的 `Manifest`。"
+    }
+  ]
+}
